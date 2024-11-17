@@ -1,12 +1,12 @@
 import sys
 import numpy as np
 import cv2
+import pandas as pd
 from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QLabel, \
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
-
 
 class RobotController(QWidget):
     def __init__(self):
@@ -70,7 +70,7 @@ class RobotController(QWidget):
         # Вертикальный слой для изображений с этапами обработки
         image_layout = QVBoxLayout()
 
-        # Добавляем виджеты для RGB, пороговой фильтрации, детекции и Depth камеры
+        # Виджеты для RGB, пороговой фильтрации, детекции и Depth камеры
         self.rgb_view = QGraphicsView()
         self.rgb_scene = QGraphicsScene()
         self.rgb_view.setScene(self.rgb_scene)
@@ -106,9 +106,22 @@ class RobotController(QWidget):
         # Добавляем вертикальный слой с изображениями на основной горизонтальный слой
         main_layout.addLayout(image_layout)
 
+        # Добавляем виджет для изображения с наложенным облаком точек
+        overlay_layout = QVBoxLayout()
+        self.overlay_view = QGraphicsView()
+        self.overlay_scene = QGraphicsScene()
+        self.overlay_view.setScene(self.overlay_scene)
+        self.overlay_image_item = QGraphicsPixmapItem()
+        self.overlay_scene.addItem(self.overlay_image_item)
+        overlay_layout.addWidget(QLabel("Overlay Point Cloud Image"))
+        overlay_layout.addWidget(self.overlay_view)
+
+        # Добавляем вертикальный слой с наложенным изображением на основной горизонтальный слой
+        main_layout.addLayout(overlay_layout)
+
         # Устанавливаем основной слой в окне
         self.setLayout(main_layout)
-        self.setGeometry(100, 100, 800, 600)
+        self.setGeometry(100, 100, 1600, 800)  # Увеличим размер окна для размещения новых виджетов
 
         # Таймер для обновления изображений с камер
         self.timer = QTimer()
@@ -175,17 +188,25 @@ class RobotController(QWidget):
 
     def update_camera_images(self):
         try:
+            # Проверяем, запущена ли симуляция
+            sim_state = self.sim.getSimulationState()
+            if sim_state != self.sim.simulation_advancing_running:
+                return  # Если симуляция не запущена, выходим из метода
+
             if not hasattr(self, 'rgb_camera_handle') or not hasattr(self, 'depth_camera_handle'):
                 print("Error: Camera handles are not set.")
                 return
 
             # Получаем изображение с RGB-камеры
-            rgb_img, resX, resY = self.sim.getVisionSensorCharImage(self.rgb_camera_handle)
-            rgb_img = np.frombuffer(rgb_img, dtype=np.uint8).reshape(resY, resX, 3)
-            rgb_img = rgb_img[::-1]  # Отражение изображения по оси Y
+            rgb_img_data, resX, resY = self.sim.getVisionSensorCharImage(self.rgb_camera_handle)
+            rgb_img = np.frombuffer(rgb_img_data, dtype=np.uint8).reshape(resY, resX, 3)
+            rgb_img = cv2.flip(rgb_img, 0)  # Отражение изображения по оси Y
+
+            # Конвертируем в BGR для OpenCV
+            bgr_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
 
             # Применение пороговой фильтрации для выделения огня
-            hsv_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
+            hsv_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
 
             # Настройка диапазонов пороговой фильтрации для огня (оранжево-жёлтый цвет)
             lower_bound = np.array([15, 100, 100])  # Нижняя граница HSV
@@ -194,32 +215,39 @@ class RobotController(QWidget):
 
             # Оценка координат очага возгорания
             contours, _ = cv2.findContours(threshold_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            detection_img = rgb_img.copy()
+            detection_img = bgr_img.copy()
             if contours:
                 largest_contour = max(contours, key=cv2.contourArea)
                 (x, y), radius = cv2.minEnclosingCircle(largest_contour)
-                cv2.circle(detection_img, (int(x), int(y)), int(radius), (255, 0, 0), 2)
-                print(
-                    f"Detected fire at coordinates: X={x}, Y={y}, Z=?")  # Z можно рассчитать с использованием данных глубины
+                cv2.circle(detection_img, (int(x), int(y)), int(radius), (0, 0, 255), 2)  # Красный круг
 
-            # Отображение оригинального изображения
-            rgb_qimg = QImage(rgb_img.data.tobytes(), resX, resY, QImage.Format_RGB888)
+            # Конвертируем изображения обратно в RGB для отображения
+            detection_img_rgb = cv2.cvtColor(detection_img, cv2.COLOR_BGR2RGB)
+
+            # Получаем изображение с Depth-камеры
+            depth_img_data, depthX, depthY = self.sim.getVisionSensorCharImage(self.depth_camera_handle)
+            depth_img = np.frombuffer(depth_img_data, dtype=np.uint8).reshape(depthY, depthX, 3)
+            depth_img = cv2.flip(depth_img, 0)
+
+            # Отображение изображений этапов
+            rgb_qimg = QImage(rgb_img.data, resX, resY, QImage.Format_RGB888)
             self.rgb_image_item.setPixmap(QPixmap.fromImage(rgb_qimg))
 
-            # Отображение пороговой фильтрации
-            threshold_qimg = QImage(threshold_img.data.tobytes(), resX, resY, QImage.Format_Grayscale8)
+            threshold_qimg = QImage(threshold_img.data, resX, resY, QImage.Format_Grayscale8)
             self.filtered_image_item.setPixmap(QPixmap.fromImage(threshold_qimg))
 
-            # Отображение детекции очага
-            detection_qimg = QImage(detection_img.data.tobytes(), resX, resY, QImage.Format_RGB888)
+            detection_qimg = QImage(detection_img_rgb.data, resX, resY, QImage.Format_RGB888)
             self.detection_image_item.setPixmap(QPixmap.fromImage(detection_qimg))
 
-            # Получаем изображение с Depth-камеры и отображаем его
-            depth_img, depthX, depthY = self.sim.getVisionSensorCharImage(self.depth_camera_handle)
-            depth_img = np.frombuffer(depth_img, dtype=np.uint8).reshape(depthY, depthX, 3)
-            depth_img = cv2.flip(depth_img, 0)
             depth_qimg = QImage(depth_img.data, depthX, depthY, QImage.Format_RGB888)
             self.depth_image_item.setPixmap(QPixmap.fromImage(depth_qimg))
+
+            # Обновляем облако точек и накладываем на RGB изображение
+            overlay_img = self.display_point_cloud(rgb_img, depth_img, threshold_img)
+
+            # Отображаем изображение с наложенным облаком точек
+            overlay_qimg = QImage(overlay_img.data, resX, resY, QImage.Format_RGB888)
+            self.overlay_image_item.setPixmap(QPixmap.fromImage(overlay_qimg))
 
             # Выполняем шаг симуляции
             self.sim.step()
@@ -227,6 +255,55 @@ class RobotController(QWidget):
         except Exception as e:
             print(f"Error updating camera images: {e}")
 
+    def display_point_cloud(self, rgb_img, depth_img, threshold_img):
+        # Конвертируем изображения в BGR для OpenCV
+        overlay_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+
+        h, w = depth_img.shape[:2]
+        fx, fy = 500, 500  # Примерные значения фокусного расстояния
+        cx, cy = w / 2, h / 2
+        points_3d = []
+        colors = []
+
+        for y in range(0, h, 20):  # Шаг 20 пикселей
+            for x in range(0, w, 20):  # Шаг 20 пикселей
+                depth = depth_img[y, x, 0]
+                if depth > 0:
+                    z = depth / 255.0 * 5.0
+                    px = (x - cx) * z / fx
+                    py = (y - cy) * z / fy
+                    points_3d.append([px, py, z])
+
+                    # Проверяем, является ли пиксель огнем
+                    if threshold_img[y, x] != 0:
+                        # Если пиксель соответствует огню, красим точку в красный
+                        color = (0, 0, 255)  # Красный цвет в BGR
+                    else:
+                        # Иначе используем исходный цвет пикселя
+                        b, g, r = overlay_img[y, x]
+                        color = (255, 0, 0)
+                    colors.append(color)
+
+        # Проекция 3D точек обратно на 2D плоскость изображения
+        points_2d = []
+        for point in points_3d:
+            x, y, z = point
+            u = int(fx * x / z + cx)
+            v = int(fy * y / z + cy)
+            points_2d.append([u, v])
+
+        # Наложение точек на изображение
+        for (u, v), color in zip(points_2d, colors):
+            if 0 <= u < w and 0 <= v < h:
+                cv2.circle(overlay_img, (u, v), 5, color, -1)  # Точки с радиусом 5
+
+        # Конвертируем обратно в RGB для отображения
+        overlay_img_rgb = cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB)
+
+        return overlay_img_rgb
+
+    def closeEvent(self, event):
+        event.accept()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
