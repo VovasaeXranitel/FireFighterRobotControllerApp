@@ -1,9 +1,12 @@
 import sys
 import numpy as np
-import cv2
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QSlider, QLabel
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QSlider, QLabel, QGraphicsView, \
+    QGraphicsScene, QGraphicsPixmapItem
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QImage, QPixmap
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+import cv2
+
 
 class RobotController(QWidget):
     def __init__(self):
@@ -14,9 +17,10 @@ class RobotController(QWidget):
 
     def initUI(self):
         self.setWindowTitle('4-Wheel Robot Controller')
-        layout = QVBoxLayout()
+        main_layout = QVBoxLayout()
 
-        # Управление движением робота
+        # Кнопки управления движением робота
+        movement_layout = QVBoxLayout()
         self.forwardButton = QPushButton('Move Forward', self)
         self.forwardButton.clicked.connect(lambda: self.move_robot(self.speed, 0))
         self.backwardButton = QPushButton('Move Backward', self)
@@ -26,32 +30,59 @@ class RobotController(QWidget):
         self.rightButton = QPushButton('Turn Right', self)
         self.rightButton.clicked.connect(lambda: self.move_robot(0, -self.speed * 0.5))
 
-        layout.addWidget(self.forwardButton)
-        layout.addWidget(self.backwardButton)
-        layout.addWidget(self.leftButton)
-        layout.addWidget(self.rightButton)
+        movement_layout.addWidget(self.forwardButton)
+        movement_layout.addWidget(self.backwardButton)
+        movement_layout.addWidget(self.leftButton)
+        movement_layout.addWidget(self.rightButton)
 
-        # Управление симуляцией
+        # Кнопки для включения и выключения моторов
+        self.motorOnButton = QPushButton('Turn Motors On', self)
+        self.motorOnButton.clicked.connect(self.turn_motors_on)
+        self.motorOffButton = QPushButton('Turn Motors Off', self)
+        self.motorOffButton.clicked.connect(self.turn_motors_off)
+        movement_layout.addWidget(self.motorOnButton)
+        movement_layout.addWidget(self.motorOffButton)
+
+        # Кнопки для запуска и остановки симуляции
         self.startSimButton = QPushButton('Start Simulation', self)
         self.startSimButton.clicked.connect(self.start_simulation)
-        layout.addWidget(self.startSimButton)
-
+        movement_layout.addWidget(self.startSimButton)
         self.stopSimButton = QPushButton('Stop Simulation', self)
         self.stopSimButton.clicked.connect(self.stop_simulation)
-        layout.addWidget(self.stopSimButton)
+        movement_layout.addWidget(self.stopSimButton)
 
         # Слайдер для регулировки скорости
         self.speedLabel = QLabel('Speed: 1', self)
-        layout.addWidget(self.speedLabel)
-
+        movement_layout.addWidget(self.speedLabel)
         self.speedSlider = QSlider(Qt.Horizontal, self)
         self.speedSlider.setRange(1, 10)
         self.speedSlider.setValue(1)
         self.speedSlider.valueChanged.connect(self.update_speed)
-        layout.addWidget(self.speedSlider)
+        movement_layout.addWidget(self.speedSlider)
 
-        self.setLayout(layout)
-        self.setGeometry(100, 100, 300, 400)
+        # Графические виджеты для отображения изображений с камер
+        self.rgb_view = QGraphicsView()
+        self.rgb_scene = QGraphicsScene()
+        self.rgb_view.setScene(self.rgb_scene)
+        self.rgb_image_item = QGraphicsPixmapItem()
+        self.rgb_scene.addItem(self.rgb_image_item)
+
+        self.depth_view = QGraphicsView()
+        self.depth_scene = QGraphicsScene()
+        self.depth_view.setScene(self.depth_scene)
+        self.depth_image_item = QGraphicsPixmapItem()
+        self.depth_scene.addItem(self.depth_image_item)
+
+        # Добавляем виджеты для отображения изображений
+        main_layout.addLayout(movement_layout)
+        main_layout.addWidget(QLabel("RGB Camera"))
+        main_layout.addWidget(self.rgb_view)
+        main_layout.addWidget(QLabel("Depth Camera"))
+        main_layout.addWidget(self.depth_view)
+
+        # Устанавливаем основной слой
+        self.setLayout(main_layout)
+        self.setGeometry(100, 100, 300, 600)
 
         # Таймер для обновления изображений с камер
         self.timer = QTimer()
@@ -63,20 +94,25 @@ class RobotController(QWidget):
             self.client = RemoteAPIClient()
             self.sim = self.client.getObject('sim')
 
-            # Получаем дескрипторы для всех четырех моторов
-            self.left_front_motor = self.sim.getObject('/leftFrontMotor')
-            self.left_rear_motor = self.sim.getObject('/leftRearMotor')
-            self.right_front_motor = self.sim.getObject('/rightFrontMotor')
-            self.right_rear_motor = self.sim.getObject('/rightRearMotor')
+            # Получаем дескрипторы для моторов
+            self.left_front_motor = self.sim.getObject('/Joint_Koleso_PL')
+            self.left_rear_motor = self.sim.getObject('/Joint_Koleso_ZL')
+            self.right_front_motor = self.sim.getObject('/Joint_Koleso_PP')
+            self.right_rear_motor = self.sim.getObject('/Joint_Koleso_ZP')
 
-            # Подключение к RGB и Depth камерам
-            self.rgb_camera_handle = self.sim.getObject('/Kamera')
-            self.depth_camera_handle = self.sim.getObject('/KameraGlubina')
+            # Подключение к RGB и Depth камерам Kinect
+            self.rgb_camera_handle = self.sim.getObjectHandle('/kinect/rgb')
+            self.depth_camera_handle = self.sim.getObjectHandle('/kinect/depth')
 
-            if self.rgb_camera_handle == -1 or self.depth_camera_handle == -1:
-                print("Error: One or both camera handles not found.")
+            if self.rgb_camera_handle == -1:
+                print("Error: RGB camera handle not found.")
             else:
-                print("Connected to both cameras in CoppeliaSim.")
+                print("RGB camera connected.")
+
+            if self.depth_camera_handle == -1:
+                print("Error: Depth camera handle not found.")
+            else:
+                print("Depth camera connected.")
 
             # Получаем разрешение камеры
             _, self.rgb_resolution = self.sim.getVisionSensorImg(self.rgb_camera_handle)
@@ -100,10 +136,15 @@ class RobotController(QWidget):
             self.sim.setJointTargetVelocity(self.left_rear_motor, left_velocity)
             self.sim.setJointTargetVelocity(self.right_front_motor, right_velocity)
             self.sim.setJointTargetVelocity(self.right_rear_motor, right_velocity)
-            self.sim.setJointTargetVelocity(self.right_rear_motor, right_velocity)
 
         except Exception as e:
             print(f"Error moving robot: {e}")
+
+    def turn_motors_on(self):
+        self.move_robot(self.speed, 0)
+
+    def turn_motors_off(self):
+        self.move_robot(0, 0)
 
     def start_simulation(self):
         try:
@@ -125,31 +166,29 @@ class RobotController(QWidget):
 
     def update_camera_images(self):
         try:
-            # Проверка на существование камеры перед обращением к ней
             if not hasattr(self, 'rgb_camera_handle') or not hasattr(self, 'depth_camera_handle'):
-                print("Error: Camera handles are not set. Please check camera connection.")
+                print("Error: Camera handles are not set.")
                 return
 
             # Получаем изображение с RGB-камеры
             rgb_img, resX, resY = self.sim.getVisionSensorCharImage(self.rgb_camera_handle)
-            rgb_img = np.frombuffer(rgb_img, dtype=np.uint8).reshape(self.rgb_resolution[1], self.rgb_resolution[0], 3)
+            rgb_img = np.frombuffer(rgb_img, dtype=np.uint8).reshape(resY, resX, 3)
             rgb_img = cv2.flip(cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB), 0)
+            rgb_qimg = QImage(rgb_img.data, resX, resY, QImage.Format_RGB888)
+            self.rgb_image_item.setPixmap(QPixmap.fromImage(rgb_qimg))
 
             # Получаем изображение с Depth-камеры
             depth_img, depthX, depthY = self.sim.getVisionSensorCharImage(self.depth_camera_handle)
-            depth_img = np.frombuffer(depth_img, dtype=np.uint8).reshape(self.depth_resolution[1], self.depth_resolution[0])
+            depth_img = np.frombuffer(depth_img, dtype=np.uint8).reshape(depthY, depthX, 3)
             depth_img = cv2.flip(depth_img, 0)
+            depth_qimg = QImage(depth_img.data, depthX, depthY, QImage.Format_RGB888)
+            self.depth_image_item.setPixmap(QPixmap.fromImage(depth_qimg))
 
-            # Отображаем изображения с камер
-            cv2.imshow('RGB Camera', rgb_img)
-            cv2.imshow('Depth Camera', depth_img)
-            cv2.waitKey(1)
-
-            # Переход к следующему шагу симуляции
             self.sim.step()
 
         except Exception as e:
             print(f"Error updating camera images: {e}")
+
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
