@@ -70,7 +70,7 @@ class RobotController(QWidget):
         # Вертикальный слой для изображений с этапами обработки
         image_layout = QVBoxLayout()
 
-        # Добавляем виджеты для оригинального изображения, пороговой фильтрации и детекции
+        # Добавляем виджеты для RGB, пороговой фильтрации, детекции и Depth камеры
         self.rgb_view = QGraphicsView()
         self.rgb_scene = QGraphicsScene()
         self.rgb_view.setScene(self.rgb_scene)
@@ -94,6 +94,14 @@ class RobotController(QWidget):
         self.detection_scene.addItem(self.detection_image_item)
         image_layout.addWidget(QLabel("Fire Detection Image"))
         image_layout.addWidget(self.detection_view)
+
+        self.depth_view = QGraphicsView()
+        self.depth_scene = QGraphicsScene()
+        self.depth_view.setScene(self.depth_scene)
+        self.depth_image_item = QGraphicsPixmapItem()
+        self.depth_scene.addItem(self.depth_image_item)
+        image_layout.addWidget(QLabel("Depth Camera Image"))
+        image_layout.addWidget(self.depth_view)
 
         # Добавляем вертикальный слой с изображениями на основной горизонтальный слой
         main_layout.addLayout(image_layout)
@@ -179,12 +187,12 @@ class RobotController(QWidget):
             # Применение пороговой фильтрации для выделения огня
             hsv_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
 
-            # Настройка диапазонов пороговой фильтрации для огня
-            lower_bound = np.array([15, 100, 100])  # Нижняя граница HSV для оранжево-жёлтого
-            upper_bound = np.array([35, 255, 255])  # Верхняя граница HSV для оранжево-жёлтого
+            # Настройка диапазонов пороговой фильтрации для огня (оранжево-жёлтый цвет)
+            lower_bound = np.array([15, 100, 100])  # Нижняя граница HSV
+            upper_bound = np.array([35, 255, 255])  # Верхняя граница HSV
             threshold_img = cv2.inRange(hsv_img, lower_bound, upper_bound)
 
-            # Оценка координат X, Y, Z очага возгорания
+            # Оценка координат очага возгорания
             contours, _ = cv2.findContours(threshold_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             detection_img = rgb_img.copy()
             if contours:
@@ -206,6 +214,14 @@ class RobotController(QWidget):
             detection_qimg = QImage(detection_img.data.tobytes(), resX, resY, QImage.Format_RGB888)
             self.detection_image_item.setPixmap(QPixmap.fromImage(detection_qimg))
 
+            # Получаем изображение с Depth-камеры и отображаем его
+            depth_img, depthX, depthY = self.sim.getVisionSensorCharImage(self.depth_camera_handle)
+            depth_img = np.frombuffer(depth_img, dtype=np.uint8).reshape(depthY, depthX, 3)
+            depth_img = cv2.flip(depth_img, 0)
+            depth_qimg = QImage(depth_img.data, depthX, depthY, QImage.Format_RGB888)
+            self.depth_image_item.setPixmap(QPixmap.fromImage(depth_qimg))
+
+            # Выполняем шаг симуляции
             self.sim.step()
 
         except Exception as e:
@@ -217,4 +233,3 @@ if __name__ == '__main__':
     controller = RobotController()
     controller.show()
     sys.exit(app.exec_())
-
