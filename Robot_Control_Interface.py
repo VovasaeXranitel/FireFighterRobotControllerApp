@@ -1,5 +1,4 @@
 import sys
-import time
 import math
 import numpy as np
 import cv2
@@ -10,6 +9,7 @@ from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPu
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from zmqRemoteApi import RemoteAPIClient
+
 
 class RobotController(QWidget):
     extinguishingFinished = pyqtSignal()
@@ -32,6 +32,23 @@ class RobotController(QWidget):
         # Флаг для отслеживания положения манипулятора
         self.manipulator_default_position = True
 
+        # Параметры Shi-Tomasi и Лукаса-Канаде
+        self.feature_params = dict(maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+        self.lk_params = dict(winSize=(15, 15), maxLevel=2,
+                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+
+        self.prev_gray_frame = None
+        self.p0 = None
+
+        # Таймеры
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_camera_images)
+        self.timer.start(50)
+
+        self.timer_flow = QTimer()
+        self.timer_flow.timeout.connect(self.update_optical_flow)
+        self.timer_flow.start(50)
+
     def initUI(self):
         self.setWindowTitle('Управление 4-колёсным роботом')
 
@@ -45,6 +62,7 @@ class RobotController(QWidget):
         self.startSimButton = QPushButton('Запустить симуляцию', self)
         self.startSimButton.clicked.connect(self.start_simulation)
         control_layout.addWidget(self.startSimButton)
+
         self.stopSimButton = QPushButton('Остановить симуляцию', self)
         self.stopSimButton.clicked.connect(self.stop_simulation)
         control_layout.addWidget(self.stopSimButton)
@@ -61,9 +79,10 @@ class RobotController(QWidget):
         # Кнопки для включения и выключения моторов
         self.motorOnButton = QPushButton('Включить моторы', self)
         self.motorOnButton.clicked.connect(self.turn_motors_on)
+        control_layout.addWidget(self.motorOnButton)
+
         self.motorOffButton = QPushButton('Выключить моторы', self)
         self.motorOffButton.clicked.connect(self.turn_motors_off)
-        control_layout.addWidget(self.motorOnButton)
         control_layout.addWidget(self.motorOffButton)
 
         # Добавляем вертикальный слой с кнопками на основной горизонтальный слой
@@ -72,7 +91,7 @@ class RobotController(QWidget):
         # Вертикальный слой для изображений с этапами обработки
         image_layout = QVBoxLayout()
 
-        # Виджеты для RGB, пороговой фильтрации, детекции и глубинной камеры
+        # RGB изображение
         self.rgb_view = QGraphicsView()
         self.rgb_scene = QGraphicsScene()
         self.rgb_view.setScene(self.rgb_scene)
@@ -81,6 +100,7 @@ class RobotController(QWidget):
         image_layout.addWidget(QLabel("Оригинальное RGB изображение"))
         image_layout.addWidget(self.rgb_view)
 
+        # Пороговая фильтрация
         self.filtered_view = QGraphicsView()
         self.filtered_scene = QGraphicsScene()
         self.filtered_view.setScene(self.filtered_scene)
@@ -89,6 +109,7 @@ class RobotController(QWidget):
         image_layout.addWidget(QLabel("Пороговая фильтрация"))
         image_layout.addWidget(self.filtered_view)
 
+        # Детекция огня
         self.detection_view = QGraphicsView()
         self.detection_scene = QGraphicsScene()
         self.detection_view.setScene(self.detection_scene)
@@ -97,6 +118,7 @@ class RobotController(QWidget):
         image_layout.addWidget(QLabel("Детекция огня"))
         image_layout.addWidget(self.detection_view)
 
+        # Изображение глубины
         self.depth_view = QGraphicsView()
         self.depth_scene = QGraphicsScene()
         self.depth_view.setScene(self.depth_scene)
@@ -108,7 +130,7 @@ class RobotController(QWidget):
         # Добавляем вертикальный слой с изображениями на основной горизонтальный слой
         main_layout.addLayout(image_layout)
 
-        # Добавляем виджет для изображения с наложенным облаком точек
+        # Виджет для изображения с наложенным облаком точек
         overlay_layout = QVBoxLayout()
         self.overlay_view = QGraphicsView()
         self.overlay_scene = QGraphicsScene()
@@ -118,17 +140,23 @@ class RobotController(QWidget):
         overlay_layout.addWidget(QLabel("Облако точек"))
         overlay_layout.addWidget(self.overlay_view)
 
-        # Добавляем вертикальный слой с наложенным изображением на основной горизонтальный слой
         main_layout.addLayout(overlay_layout)
+
+        # Виджет для отображения оптического потока
+        optical_flow_layout = QVBoxLayout()
+        self.optical_flow_view = QGraphicsView()
+        self.optical_flow_scene = QGraphicsScene()
+        self.optical_flow_view.setScene(self.optical_flow_scene)
+        self.optical_flow_image_item = QGraphicsPixmapItem()
+        self.optical_flow_scene.addItem(self.optical_flow_image_item)
+        optical_flow_layout.addWidget(QLabel("Оптический поток"))
+        optical_flow_layout.addWidget(self.optical_flow_view)
+
+        main_layout.addLayout(optical_flow_layout)
 
         # Устанавливаем основной слой в окне
         self.setLayout(main_layout)
         self.setGeometry(100, 100, 1600, 800)
-
-        # Таймер для обновления изображений с камер
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_camera_images)
-        self.timer.start(50)  # Обновление каждые 50 мс
 
     def connectToSim(self):
         try:
@@ -142,19 +170,82 @@ class RobotController(QWidget):
             self.right_rear_motor = self.sim.getObject('/Joint_Koleso_ZP')
 
             # Подключение к RGB и глубинной камерам Kinect
-            self.rgb_camera_handle = self.sim.getObject('/kinect/rgb')
-            self.depth_camera_handle = self.sim.getObject('/kinect/depth')
+            try:
+                self.rgb_camera_handle = self.sim.getObject('/kinect/rgb')
+            except Exception as e:
+                print("Ошибка: Камера RGB не найдена. Проверьте путь '/kinect/rgb'.")
+                raise e
+
+            try:
+                self.depth_camera_handle = self.sim.getObject('/kinect/depth')
+            except Exception as e:
+                print("Ошибка: Камера глубины не найдена. Проверьте путь '/kinect/depth'.")
+                raise e
+
+            # Параметры камеры
+            resolution = self.sim.getVisionSensorResolution(self.rgb_camera_handle)
+            resX, resY = resolution
+            self.fx, self.fy = resX / 2.0, resY / 2.0
+            self.cx, self.cy = resX / 2.0, resY / 2.0
 
             # Получаем дескрипторы для манипулятора
             self.manipulator_joint_x = self.sim.getObject('/Joint_Osi_X_Polivalka')
             self.manipulator_joint_y = self.sim.getObject('/Joint_Osi_Y_Polivalka')
 
-            # Параметры камеры
-            self.fx, self.fy = 500, 500  # Настройте эти значения в соответствии с параметрами вашей камеры
-            self.cx, self.cy = 320, 240  # Предположим, что разрешение камеры 640x480
-
         except Exception as e:
             print(f"Ошибка подключения: {e}")
+            traceback.print_exc()
+
+    def update_optical_flow(self):
+        try:
+            # Получаем изображение с камеры
+            rgb_img_data, resX, resY = self.sim.getVisionSensorCharImage(self.rgb_camera_handle)
+            frame = np.frombuffer(rgb_img_data, dtype=np.uint8).reshape(resY, resX, 3)
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+            if self.prev_gray_frame is None:
+                # Инициализируем точки при первом вызове
+                self.prev_gray_frame = gray_frame
+                self.p0 = cv2.goodFeaturesToTrack(self.prev_gray_frame, mask=None, **self.feature_params)
+                return
+
+            if self.p0 is None or len(self.p0) == 0:
+                # Если точки отсутствуют, переинициализируем их
+                self.p0 = cv2.goodFeaturesToTrack(gray_frame, mask=None, **self.feature_params)
+                self.prev_gray_frame = gray_frame
+                return
+
+            # Вычисляем оптический поток
+            p1, st, err = cv2.calcOpticalFlowPyrLK(self.prev_gray_frame, gray_frame, self.p0, None, **self.lk_params)
+
+            if p1 is not None:
+                good_new = p1[st == 1]
+                good_old = self.p0[st == 1]
+
+                # Рисуем векторы оптического потока
+                flow_frame = frame.copy()
+                for new, old in zip(good_new, good_old):
+                    x_new, y_new = new.ravel()
+                    x_old, y_old = old.ravel()
+                    cv2.arrowedLine(flow_frame, (int(x_old), int(y_old)), (int(x_new), int(y_new)),
+                                    (0, 255, 0), 2, tipLength=0.5)
+
+                # Обновляем виджет отображения
+                flow_frame_flipped = cv2.flip(flow_frame, 0)  # Переворачиваем изображение по вертикали
+                qimg = QImage(flow_frame_flipped.data, flow_frame_flipped.shape[1], flow_frame_flipped.shape[0],
+                              flow_frame_flipped.strides[0], QImage.Format_RGB888)
+                self.optical_flow_image_item.setPixmap(QPixmap.fromImage(qimg))
+
+                # Обновляем предыдущий кадр и точки
+                self.prev_gray_frame = gray_frame.copy()
+                self.p0 = good_new.reshape(-1, 1, 2)
+            else:
+                # Если поток не вычислен, реинициализируем точки
+                self.p0 = cv2.goodFeaturesToTrack(gray_frame, mask=None, **self.feature_params)
+                self.prev_gray_frame = gray_frame
+
+        except Exception as e:
+            print(f"Ошибка при обновлении оптического потока: {e}")
             traceback.print_exc()
 
     def move_robot(self, linear_velocity, angular_velocity):
@@ -216,15 +307,10 @@ class RobotController(QWidget):
             # Получаем изображение с RGB-камеры
             rgb_img_data, resX, resY = self.sim.getVisionSensorCharImage(self.rgb_camera_handle)
             rgb_img = np.frombuffer(rgb_img_data, dtype=np.uint8).reshape(resY, resX, 3)
-            # Не инвертируем изображение, оставляем как есть для правильной обработки
-
-            # Конвертируем в BGR для OpenCV
             bgr_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
 
             # Применение пороговой фильтрации для выделения огня
             hsv_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
-
-            # Настройка диапазонов пороговой фильтрации для огня (оранжево-жёлтый цвет)
             lower_bound = np.array([15, 100, 100])  # Нижняя граница HSV
             upper_bound = np.array([35, 255, 255])  # Верхняя граница HSV
             threshold_img = cv2.inRange(hsv_img, lower_bound, upper_bound)
@@ -244,10 +330,10 @@ class RobotController(QWidget):
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
                     fire_coordinates = (cx, cy)
-                    fire_detected = True  # Устанавливаем в True только если удалось вычислить центр масс
+                    fire_detected = True
 
                     # Рисуем центр очага на изображении
-                    cv2.circle(detection_img, fire_coordinates, 5, (0, 0, 255), -1)  # Красная точка
+                    cv2.circle(detection_img, fire_coordinates, 5, (0, 0, 255), -1)
 
                     # Вычисляем расстояние до огня
                     depth = self.get_depth_at_point(fire_coordinates[0], fire_coordinates[1])
@@ -257,22 +343,13 @@ class RobotController(QWidget):
                     else:
                         print("Не удалось получить глубину в точке огня.")
                 else:
-                    fire_detected = False  # Если не удалось вычислить центр масс, считаем, что огонь не обнаружен
-
-            else:
-                fire_detected = False
-
-            # Конвертируем изображения обратно в RGB для отображения
-            detection_img_rgb = cv2.cvtColor(detection_img, cv2.COLOR_BGR2RGB)
-
-            # Получаем разрешение глубинного сенсора
-            resolution = self.sim.getVisionSensorResolution(self.depth_camera_handle)
-            depthX, depthY = resolution
+                    fire_detected = False
 
             # Получаем изображение с глубинной камеры
+            resolution = self.sim.getVisionSensorResolution(self.depth_camera_handle)
+            depthX, depthY = resolution
             depth_buffer = self.sim.getVisionSensorDepth(self.depth_camera_handle)[0]
             depth_img = np.frombuffer(depth_buffer, dtype=np.float32).reshape((depthY, depthX))
-            # Не инвертируем изображение глубины
 
             # Нормализация глубинного изображения для отображения
             depth_display_img = cv2.normalize(depth_img, None, 0, 255, cv2.NORM_MINMAX)
@@ -285,15 +362,13 @@ class RobotController(QWidget):
 
             # Автономное управление
             if fire_detected:
-                # Огонь обнаружен и центр масс вычислен
                 self.aim_manipulator(fire_coordinates, depth_img, self.fx, self.fy, self.cx, self.cy)
                 self.manipulator_default_position = False
 
                 if self.fire_extinguishing:
-                    # Робот тушит огонь
-                    self.move_robot(0, 0)
+                    self.move_robot(0, 0)  # Робот тушит огонь
                 elif fire_distance is not None and fire_distance < 0.5:
-                    # Достаточно близко к огню, начинаем тушение
+                    # Начинаем тушение, если достаточно близко
                     self.fire_extinguishing = True
                     self.fire_detected_once = True
                     self.extinguishing_timer.start(30000)  # 30 секунд
@@ -303,51 +378,49 @@ class RobotController(QWidget):
                     # Продолжаем движение к огню
                     self.move_robot(self.speed, 0)
             else:
-                # Огонь не обнаружен или центр масс не вычислен
                 if not self.manipulator_default_position:
                     # Возвращаем манипулятор в исходное положение
                     self.reset_manipulator()
                     self.manipulator_default_position = True
 
                 if obstacle_detected:
-                    # Обход препятствия: робот поворачивает на месте
-                    self.move_robot(0, turn_direction * self.speed)
+                    # Избегание препятствий
+                    self.move_robot(0, turn_direction * self.speed * 0.5)  # Замедляем разворот
                 else:
-                    # Движемся вперёд
                     self.move_robot(self.speed, 0)
 
-            # Проекция 3D точек на 2D плоскость
-            points_2d = []
-            for point in points_3d:
-                x, y, z = point
-                u = int(self.fx * x / z + self.cx)
-                v = int(self.fy * y / z + self.cy)
-                points_2d.append([u, v])
-
-            # Отображаем облако точек
-            overlay_img = self.display_point_cloud(rgb_img, points_2d, colors)
-
-            # *** Применяем вертикальное инвертирование только для отображения ***
-            rgb_display_img = cv2.flip(rgb_img, 0)  # Инвертируем по вертикали для интерфейса
+            # Конвертируем изображения обратно в RGB для отображения
+            rgb_display_img = cv2.flip(rgb_img, 0)
             threshold_display_img = cv2.flip(threshold_img, 0)
-            detection_display_img = cv2.flip(detection_img_rgb, 0)
+            detection_display_img = cv2.flip(detection_img, 0)
             depth_display_img_flipped = cv2.flip(depth_display_img, 0)
-            overlay_display_img = cv2.flip(overlay_img, 0)
 
-            # Отображение изображений этапов
-            rgb_qimg = QImage(rgb_display_img.data, rgb_display_img.shape[1], rgb_display_img.shape[0], rgb_display_img.strides[0], QImage.Format_RGB888)
+            # Отображение этапов обработки
+            rgb_qimg = QImage(rgb_display_img.data, rgb_display_img.shape[1], rgb_display_img.shape[0],
+                              rgb_display_img.strides[0], QImage.Format_RGB888)
             self.rgb_image_item.setPixmap(QPixmap.fromImage(rgb_qimg))
 
-            threshold_qimg = QImage(threshold_display_img.data, threshold_display_img.shape[1], threshold_display_img.shape[0], threshold_display_img.strides[0], QImage.Format_Grayscale8)
+            threshold_qimg = QImage(threshold_display_img.data, threshold_display_img.shape[1],
+                                    threshold_display_img.shape[0], threshold_display_img.strides[0],
+                                    QImage.Format_Grayscale8)
             self.filtered_image_item.setPixmap(QPixmap.fromImage(threshold_qimg))
 
-            detection_qimg = QImage(detection_display_img.data, detection_display_img.shape[1], detection_display_img.shape[0], detection_display_img.strides[0], QImage.Format_RGB888)
+            detection_qimg = QImage(detection_display_img.data, detection_display_img.shape[1],
+                                    detection_display_img.shape[0], detection_display_img.strides[0],
+                                    QImage.Format_RGB888)
             self.detection_image_item.setPixmap(QPixmap.fromImage(detection_qimg))
 
-            depth_qimg = QImage(depth_display_img_flipped.data, depth_display_img_flipped.shape[1], depth_display_img_flipped.shape[0], depth_display_img_flipped.strides[0], QImage.Format_RGB888)
+            depth_qimg = QImage(depth_display_img_flipped.data, depth_display_img_flipped.shape[1],
+                                depth_display_img_flipped.shape[0], depth_display_img_flipped.strides[0],
+                                QImage.Format_RGB888)
             self.depth_image_item.setPixmap(QPixmap.fromImage(depth_qimg))
 
-            overlay_qimg = QImage(overlay_display_img.data, overlay_display_img.shape[1], overlay_display_img.shape[0], overlay_display_img.strides[0], QImage.Format_RGB888)
+            # Обновление изображения облака точек
+            points_2d = self.project_to_2d(points_3d, self.fx, self.fy, self.cx, self.cy)
+            overlay_img = self.display_point_cloud(rgb_img, points_2d, colors)
+            overlay_display_img = cv2.flip(overlay_img, 0)
+            overlay_qimg = QImage(overlay_display_img.data, overlay_display_img.shape[1], overlay_display_img.shape[0],
+                                  overlay_display_img.strides[0], QImage.Format_RGB888)
             self.overlay_image_item.setPixmap(QPixmap.fromImage(overlay_qimg))
 
         except Exception as e:
@@ -409,7 +482,6 @@ class RobotController(QWidget):
 
         for point in points_3d:
             x, y, z = point
-            # Проверяем точки перед роботом в пределах obstacle_threshold
             if 0.1 < z < obstacle_threshold and abs(x) < 0.7:
                 obstacle_detected = True
                 if x < 0:
@@ -417,28 +489,43 @@ class RobotController(QWidget):
                 else:
                     right_points += 1
 
-        turn_direction = 1  # По умолчанию поворачиваем вправо
-        if left_points > right_points:
-            turn_direction = 1  # Поворачиваем вправо
-        elif right_points > left_points:
-            turn_direction = -1  # Поворачиваем влево
+        if obstacle_detected:
+            if left_points > right_points:
+                turn_direction = 1  # Поворачиваем вправо
+            else:
+                turn_direction = -1  # Поворачиваем влево
+            print(f"Обнаружено препятствие. Поворачиваем {'вправо' if turn_direction == 1 else 'влево'}.")
         else:
-            turn_direction = random.choice([-1, 1])  # Случайный выбор
+            turn_direction = 0  # Продолжать движение
 
         return obstacle_detected, turn_direction
 
+    def project_to_2d(self,points_3d, fx, fy, cx, cy):
+        points_2d = []
+        for point in points_3d:
+            if len(point) == 3:  # Убедитесь, что точка имеет три координаты
+                x, y, z = point
+                if z > 0:  # Избегаем деления на ноль
+                    u = fx * x / z + cx
+                    v = fy * y / z + cy
+                    points_2d.append((u, v))
+                else:
+                    print(f"Пропуск точки с некорректным z: {z}")
+            else:
+                print(f"Пропуск точки с неправильным форматом: {point}")
+        return points_2d
+
     def display_point_cloud(self, rgb_img, points_2d, colors):
-        overlay_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
-        h, w = overlay_img.shape[:2]
-
-        # Наложение точек на изображение
         for (u, v), color in zip(points_2d, colors):
-            if 0 <= u < w and 0 <= v < h:
-                cv2.circle(overlay_img, (u, v), 2, color, -1)
+           overlay_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+           h, w = overlay_img.shape[:2]
 
-        # Конвертируем обратно в RGB для отображения
-        overlay_img_rgb = cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB)
-        return overlay_img_rgb
+           for (u, v), color in zip(points_2d, colors):
+               if 0 <= u < w and 0 <= v < h:
+                   cv2.circle(overlay_img, (int(u), int(v)), 2, color, -1)
+
+           overlay_img_rgb = cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB)
+           return overlay_img_rgb
 
     def aim_manipulator(self, fire_coordinates, depth_img, fx, fy, cx, cy):
         x_img, y_img = fire_coordinates
