@@ -4,11 +4,29 @@ import numpy as np
 import cv2
 import traceback
 import random
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QLabel, \
-    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
+import time
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QSlider, QLabel, QGraphicsView,
+    QGraphicsScene, QGraphicsPixmapItem
+)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from zmqRemoteApi import RemoteAPIClient
+
+
+###########################################################
+# Глобальный перехватчик необработанных исключений
+###########################################################
+def my_excepthook(exctype, value, tb):
+    print("Необработанное исключение!")
+    traceback.print_exception(exctype, value, tb)
+    input("Нажмите Enter, чтобы выйти.")
+    sys.exit(1)
+
+sys.excepthook = my_excepthook
+###########################################################
 
 
 class RobotController(QWidget):
@@ -16,151 +34,172 @@ class RobotController(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.initUI()
-        self.connectToSim()
-        self.speed = 1
+        try:
+            self.initUI()
+            self.connectToSim()
+            self.speed = 1
 
-        # Флаги и таймеры для тушения огня
-        self.fire_extinguishing = False
-        self.fire_detected_once = False
+            # Флаги и таймеры для тушения огня
+            self.fire_extinguishing = False
+            self.fire_detected_once = False
 
-        # Таймер для тушения огня
-        self.extinguishing_timer = QTimer()
-        self.extinguishing_timer.setSingleShot(True)
-        self.extinguishing_timer.timeout.connect(self.on_extinguishing_finished)
+            # Таймер для тушения огня
+            self.extinguishing_timer = QTimer()
+            self.extinguishing_timer.setSingleShot(True)
+            self.extinguishing_timer.timeout.connect(self.on_extinguishing_finished)
 
-        # Флаг для отслеживания положения манипулятора
-        self.manipulator_default_position = True
+            # Флаг для отслеживания положения манипулятора
+            self.manipulator_default_position = True
 
-        # Параметры Shi-Tomasi и Лукаса-Канаде
-        self.feature_params = dict(maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
-        self.lk_params = dict(winSize=(15, 15), maxLevel=2,
-                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+            # Параметры Shi-Tomasi и Лукаса-Канаде
+            self.feature_params = dict(maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+            self.lk_params = dict(winSize=(15, 15), maxLevel=2,
+                                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
 
-        self.prev_gray_frame = None
-        self.p0 = None
+            self.prev_gray_frame = None
+            self.p0 = None
 
-        # Таймеры
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_camera_images)
-        self.timer.start(50)
+            # Таймеры
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.update_camera_images)
+            self.timer.start(50)
 
-        self.timer_flow = QTimer()
-        self.timer_flow.timeout.connect(self.update_optical_flow)
-        self.timer_flow.start(50)
+            self.timer_flow = QTimer()
+            self.timer_flow.timeout.connect(self.update_optical_flow)
+            self.timer_flow.start(50)
+
+            # Для движения змейкой
+            self.snake_step = 0
+            self.snake_direction = 1
+            self.snake_timer = None
+
+            self.obstacle_phase = 0  # Для отслеживания этапов при объезде
+            self.back_timer = None  # Таймер для отъезда назад
+            self.turn_timer = None  # Таймер для поворота
+
+
+        except Exception as e:
+            print("Ошибка в __init__:")
+            traceback.print_exc()
 
     def initUI(self):
-        self.setWindowTitle('Управление 4-колёсным роботом')
+        try:
+            self.setWindowTitle('Управление 4-колёсным роботом')
 
-        # Основной горизонтальный слой
-        main_layout = QHBoxLayout()
+            # Основной горизонтальный слой
+            main_layout = QHBoxLayout()
 
-        # Вертикальный слой для кнопок управления и ползунка скорости
-        control_layout = QVBoxLayout()
+            # Вертикальный слой для кнопок управления и ползунка скорости
+            control_layout = QVBoxLayout()
 
-        # Кнопки для запуска и остановки симуляции
-        self.startSimButton = QPushButton('Запустить симуляцию', self)
-        self.startSimButton.clicked.connect(self.start_simulation)
-        control_layout.addWidget(self.startSimButton)
+            # Кнопки для запуска и остановки симуляции
+            self.startSimButton = QPushButton('Запустить симуляцию', self)
+            self.startSimButton.clicked.connect(self.start_simulation)
+            control_layout.addWidget(self.startSimButton)
 
-        self.stopSimButton = QPushButton('Остановить симуляцию', self)
-        self.stopSimButton.clicked.connect(self.stop_simulation)
-        control_layout.addWidget(self.stopSimButton)
+            self.stopSimButton = QPushButton('Остановить симуляцию', self)
+            self.stopSimButton.clicked.connect(self.stop_simulation)
+            control_layout.addWidget(self.stopSimButton)
 
-        # Слайдер для регулировки скорости
-        self.speedLabel = QLabel('Скорость: 1', self)
-        control_layout.addWidget(self.speedLabel)
-        self.speedSlider = QSlider(Qt.Horizontal, self)
-        self.speedSlider.setRange(1, 10)
-        self.speedSlider.setValue(1)
-        self.speedSlider.valueChanged.connect(self.update_speed)
-        control_layout.addWidget(self.speedSlider)
+            # Слайдер для регулировки скорости
+            self.speedLabel = QLabel('Скорость: 1', self)
+            control_layout.addWidget(self.speedLabel)
+            self.speedSlider = QSlider(Qt.Horizontal, self)
+            self.speedSlider.setRange(1, 10)
+            self.speedSlider.setValue(1)
+            self.speedSlider.valueChanged.connect(self.update_speed)
+            control_layout.addWidget(self.speedSlider)
 
-        # Кнопки для включения и выключения моторов
-        self.motorOnButton = QPushButton('Включить моторы', self)
-        self.motorOnButton.clicked.connect(self.turn_motors_on)
-        control_layout.addWidget(self.motorOnButton)
+            # Кнопки для включения и выключения моторов
+            self.motorOnButton = QPushButton('Включить моторы', self)
+            self.motorOnButton.clicked.connect(self.turn_motors_on)
+            control_layout.addWidget(self.motorOnButton)
 
-        self.motorOffButton = QPushButton('Выключить моторы', self)
-        self.motorOffButton.clicked.connect(self.turn_motors_off)
-        control_layout.addWidget(self.motorOffButton)
+            self.motorOffButton = QPushButton('Выключить моторы', self)
+            self.motorOffButton.clicked.connect(self.turn_motors_off)
+            control_layout.addWidget(self.motorOffButton)
 
-        # Добавляем вертикальный слой с кнопками на основной горизонтальный слой
-        main_layout.addLayout(control_layout)
+            # Кнопка для запуска змейки
+            self.snakeButton = QPushButton('Двигаться по змейке', self)
+            self.snakeButton.clicked.connect(self.move_snake_pattern)
+            control_layout.addWidget(self.snakeButton)
 
-        # Вертикальный слой для изображений с этапами обработки
-        image_layout = QVBoxLayout()
+            # Добавляем вертикальный слой с кнопками на основной горизонтальный слой
+            main_layout.addLayout(control_layout)
 
-        # RGB изображение
-        self.rgb_view = QGraphicsView()
-        self.rgb_scene = QGraphicsScene()
-        self.rgb_view.setScene(self.rgb_scene)
-        self.rgb_image_item = QGraphicsPixmapItem()
-        self.rgb_scene.addItem(self.rgb_image_item)
-        image_layout.addWidget(QLabel("Оригинальное RGB изображение"))
-        image_layout.addWidget(self.rgb_view)
+            # Вертикальный слой для изображений с этапами обработки
+            image_layout = QVBoxLayout()
 
-        # Пороговая фильтрация
-        self.filtered_view = QGraphicsView()
-        self.filtered_scene = QGraphicsScene()
-        self.filtered_view.setScene(self.filtered_scene)
-        self.filtered_image_item = QGraphicsPixmapItem()
-        self.filtered_scene.addItem(self.filtered_image_item)
-        image_layout.addWidget(QLabel("Пороговая фильтрация"))
-        image_layout.addWidget(self.filtered_view)
+            # RGB изображение
+            self.rgb_view = QGraphicsView()
+            self.rgb_scene = QGraphicsScene()
+            self.rgb_view.setScene(self.rgb_scene)
+            self.rgb_image_item = QGraphicsPixmapItem()
+            self.rgb_scene.addItem(self.rgb_image_item)
+            image_layout.addWidget(QLabel("Оригинальное RGB изображение"))
+            image_layout.addWidget(self.rgb_view)
 
-        # Детекция огня
-        self.detection_view = QGraphicsView()
-        self.detection_scene = QGraphicsScene()
-        self.detection_view.setScene(self.detection_scene)
-        self.detection_image_item = QGraphicsPixmapItem()
-        self.detection_scene.addItem(self.detection_image_item)
-        image_layout.addWidget(QLabel("Детекция огня"))
-        image_layout.addWidget(self.detection_view)
+            # Пороговая фильтрация
+            self.filtered_view = QGraphicsView()
+            self.filtered_scene = QGraphicsScene()
+            self.filtered_view.setScene(self.filtered_scene)
+            self.filtered_image_item = QGraphicsPixmapItem()
+            self.filtered_scene.addItem(self.filtered_image_item)
+            image_layout.addWidget(QLabel("Пороговая фильтрация"))
+            image_layout.addWidget(self.filtered_view)
 
-        # Изображение глубины
-        self.depth_view = QGraphicsView()
-        self.depth_scene = QGraphicsScene()
-        self.depth_view.setScene(self.depth_scene)
-        self.depth_image_item = QGraphicsPixmapItem()
-        self.depth_scene.addItem(self.depth_image_item)
-        image_layout.addWidget(QLabel("Изображение глубины"))
-        image_layout.addWidget(self.depth_view)
+            # Детекция огня
+            self.detection_view = QGraphicsView()
+            self.detection_scene = QGraphicsScene()
+            self.detection_view.setScene(self.detection_scene)
+            self.detection_image_item = QGraphicsPixmapItem()
+            self.detection_scene.addItem(self.detection_image_item)
+            image_layout.addWidget(QLabel("Детекция огня"))
+            image_layout.addWidget(self.detection_view)
 
-        # Добавляем вертикальный слой с изображениями на основной горизонтальный слой
-        main_layout.addLayout(image_layout)
+            # Изображение глубины
+            self.depth_view = QGraphicsView()
+            self.depth_scene = QGraphicsScene()
+            self.depth_view.setScene(self.depth_scene)
+            self.depth_image_item = QGraphicsPixmapItem()
+            self.depth_scene.addItem(self.depth_image_item)
+            image_layout.addWidget(QLabel("Изображение глубины"))
+            image_layout.addWidget(self.depth_view)
 
-        # Виджет для изображения с наложенным облаком точек
-        overlay_layout = QVBoxLayout()
-        self.overlay_view = QGraphicsView()
-        self.overlay_scene = QGraphicsScene()
-        self.overlay_view.setScene(self.overlay_scene)
-        self.overlay_image_item = QGraphicsPixmapItem()
-        self.overlay_scene.addItem(self.overlay_image_item)
-        overlay_layout.addWidget(QLabel("Облако точек"))
-        overlay_layout.addWidget(self.overlay_view)
+            # Добавляем вертикальный слой с изображениями на основной горизонтальный слой
+            main_layout.addLayout(image_layout)
 
-        main_layout.addLayout(overlay_layout)
+            # Виджет для изображения с наложенным облаком точек
+            overlay_layout = QVBoxLayout()
+            self.overlay_view = QGraphicsView()
+            self.overlay_scene = QGraphicsScene()
+            self.overlay_view.setScene(self.overlay_scene)
+            self.overlay_image_item = QGraphicsPixmapItem()
+            self.overlay_scene.addItem(self.overlay_image_item)
+            overlay_layout.addWidget(QLabel("Облако точек"))
+            overlay_layout.addWidget(self.overlay_view)
 
-        # Виджет для отображения оптического потока
-        optical_flow_layout = QVBoxLayout()
-        self.optical_flow_view = QGraphicsView()
-        self.optical_flow_scene = QGraphicsScene()
-        self.optical_flow_view.setScene(self.optical_flow_scene)
-        self.optical_flow_image_item = QGraphicsPixmapItem()
-        self.optical_flow_scene.addItem(self.optical_flow_image_item)
-        optical_flow_layout.addWidget(QLabel("Оптический поток"))
-        optical_flow_layout.addWidget(self.optical_flow_view)
+            main_layout.addLayout(overlay_layout)
 
-        main_layout.addLayout(optical_flow_layout)
+            # Виджет для отображения оптического потока
+            optical_flow_layout = QVBoxLayout()
+            self.optical_flow_view = QGraphicsView()
+            self.optical_flow_scene = QGraphicsScene()
+            self.optical_flow_view.setScene(self.optical_flow_scene)
+            self.optical_flow_image_item = QGraphicsPixmapItem()
+            self.optical_flow_scene.addItem(self.optical_flow_image_item)
+            optical_flow_layout.addWidget(QLabel("Оптический поток"))
+            optical_flow_layout.addWidget(self.optical_flow_view)
 
-        # Устанавливаем основной слой в окне
-        self.setLayout(main_layout)
-        self.setGeometry(100, 100, 1600, 800)
+            main_layout.addLayout(optical_flow_layout)
 
-        self.snakeButton = QPushButton('Двигаться по змейке', self)
-        self.snakeButton.clicked.connect(self.move_snake_pattern)
-        control_layout.addWidget(self.snakeButton)
+            # Устанавливаем основной слой в окне
+            self.setLayout(main_layout)
+            self.setGeometry(100, 100, 1600, 800)
+
+        except Exception as e:
+            print("Ошибка в initUI:")
+            traceback.print_exc()
 
     def connectToSim(self):
         try:
@@ -197,7 +236,7 @@ class RobotController(QWidget):
             self.manipulator_joint_y = self.sim.getObject('/Joint_Osi_Y_Polivalka')
 
         except Exception as e:
-            print(f"Ошибка подключения: {e}")
+            print("Ошибка подключения к CoppeliaSim:")
             traceback.print_exc()
 
     def update_optical_flow(self):
@@ -249,16 +288,16 @@ class RobotController(QWidget):
                 self.prev_gray_frame = gray_frame
 
         except Exception as e:
-            print(f"Ошибка при обновлении оптического потока: {e}")
+            print("Ошибка при обновлении оптического потока:")
             traceback.print_exc()
 
     def move_robot(self, linear_velocity, angular_velocity):
-        # Ограничиваем скорость
-        max_speed = 5.0
-        linear_velocity = np.clip(linear_velocity, -max_speed, max_speed)
-        angular_velocity = np.clip(angular_velocity, -max_speed, max_speed)
-
         try:
+            # Ограничиваем скорость
+            max_speed = 5.0
+            linear_velocity = np.clip(linear_velocity, -max_speed, max_speed)
+            angular_velocity = np.clip(angular_velocity, -max_speed, max_speed)
+
             left_velocity = linear_velocity - angular_velocity
             right_velocity = linear_velocity + angular_velocity
 
@@ -268,21 +307,29 @@ class RobotController(QWidget):
             self.sim.setJointTargetVelocity(self.right_rear_motor, right_velocity)
 
         except Exception as e:
-            print(f"Ошибка при движении робота: {e}")
+            print("Ошибка при движении робота:")
             traceback.print_exc()
 
     def turn_motors_on(self):
-        self.move_robot(self.speed, 0)
+        try:
+            self.move_robot(self.speed, 0)
+        except Exception as e:
+            print("Ошибка при включении моторов:")
+            traceback.print_exc()
 
     def turn_motors_off(self):
-        self.move_robot(0, 0)
+        try:
+            self.move_robot(0, 0)
+        except Exception as e:
+            print("Ошибка при выключении моторов:")
+            traceback.print_exc()
 
     def start_simulation(self):
         try:
             self.sim.startSimulation()
             print("Симуляция запущена.")
         except Exception as e:
-            print(f"Ошибка при запуске симуляции: {e}")
+            print("Ошибка при запуске симуляции:")
             traceback.print_exc()
 
     def stop_simulation(self):
@@ -290,12 +337,198 @@ class RobotController(QWidget):
             self.sim.stopSimulation()
             print("Симуляция остановлена.")
         except Exception as e:
-            print(f"Ошибка при остановке симуляции: {e}")
+            print("Ошибка при остановке симуляции:")
             traceback.print_exc()
 
     def update_speed(self, value):
-        self.speed = value
-        self.speedLabel.setText(f'Скорость: {value}')
+        try:
+            self.speed = value
+            self.speedLabel.setText(f'Скорость: {value}')
+        except Exception as e:
+            print("Ошибка при обновлении скорости:")
+            traceback.print_exc()
+
+    ####################################################################
+    #                        Автономное движение
+    ####################################################################
+    def move_snake_pattern(self):
+        """
+        Запускает движение «змейкой» в автономном режиме.
+        """
+        try:
+            # Инициализируем шаги, направление
+            self.snake_step = 0
+            self.snake_direction = 1
+
+            if self.snake_timer is None:
+                self.snake_timer = QTimer()
+                self.snake_timer.timeout.connect(self.execute_snake_step)
+
+            self.snake_timer.start(3000)  # Каждые 3 секунды меняем движение
+            print("Движение по змейке запущено.")
+        except Exception as e:
+            print("Ошибка при запуске движения змейкой:")
+            traceback.print_exc()
+
+    def execute_snake_step(self):
+        """
+        Выполняет один шаг в траектории «змейки».
+        Если обнаружено препятствие, останавливаем «змейку»
+        и переходим в режим постоянного объезда,
+        пока препятствие не исчезнет.
+        """
+        try:
+            obstacle_detected, turn_direction = self.analyze_point_cloud_for_snake()
+
+            if obstacle_detected:
+                print("Обнаружено препятствие. Переходим в режим объезда.")
+                self.stop_snake_timer()  # Останавливаем обычное движение змейкой
+                # Запускаем «цикл объезда»
+                self.handle_obstacle(turn_direction)
+            else:
+                # Обычная логика змейки
+                if self.snake_step % 2 == 0:
+                    print("Робот двигается прямо (шаг змейки).")
+                    self.move_robot(self.speed, 0)
+                else:
+                    dir_text = 'вправо' if self.snake_direction == 1 else 'влево'
+                    print(f"Робот поворачивает {dir_text} (шаг змейки).")
+                    self.move_robot(0, self.snake_direction * self.speed * 0.5)
+                    self.snake_direction *= -1  # Меняем направление
+
+                self.snake_step += 1
+        except Exception as e:
+            print("Ошибка при выполнении шага змейки:")
+            traceback.print_exc()
+
+    def handle_obstacle(self, desired_direction):
+        """
+        'Цикл объезда': пока робот видит препятствие,
+        он продолжает выполнять манёвры объезда (например, отъезжает назад, поворачивает).
+        После каждого шага снова проверяем, осталось ли препятствие.
+
+        desired_direction — направление (1: вправо, -1: влево),
+        в которое робот будет стараться уводить нос, чтобы обойти препятствие.
+        """
+        try:
+            obstacle_detected, turn_dir = self.analyze_point_cloud_for_snake()
+
+            if obstacle_detected:
+                print("Робот всё ещё видит препятствие, продолжаем объезжать...")
+                # Например, сдаём чуть назад и поворачиваем
+                # 1) Назад (либо сразу поворот, на ваш выбор)
+                self.move_robot(-self.speed, 0)
+
+                # Через секунду делаем поворот
+                QTimer.singleShot(1000, lambda: self._turn_and_check(desired_direction))
+            else:
+                print("Препятствие исчезло, возвращаемся к змейке.")
+                self.resume_snake_timer()  # Возобновляем движение змейкой
+        except Exception as e:
+            print("Ошибка в handle_obstacle:")
+            traceback.print_exc()
+
+    def _turn_and_check(self, desired_direction):
+        """
+        Вызывается после того, как робот чуть отъехал назад.
+        Теперь делаем поворот, затем снова проверяем препятствие.
+        """
+        try:
+            # Поворот (усиленный)
+            self.move_robot(0, desired_direction * self.speed * 0.7)
+
+            # Ещё через секунду снова проверяем, осталось ли препятствие
+            QTimer.singleShot(1000, lambda: self.handle_obstacle(desired_direction))
+        except Exception as e:
+            print("Ошибка в _turn_and_check:")
+            traceback.print_exc()
+
+    def analyze_point_cloud_for_snake(self):
+        """
+        Упрощённая проверка препятствий перед роботом
+        (можно переиспользовать analyze_point_cloud, если удобно).
+        Возвращает (obstacle_detected, turn_direction).
+        """
+        try:
+            # Получаем текущее глубинное изображение
+            depth_buffer = self.sim.getVisionSensorDepth(self.depth_camera_handle)[0]
+            depthX, depthY = self.sim.getVisionSensorResolution(self.depth_camera_handle)
+            depth_img = np.frombuffer(depth_buffer, dtype=np.float32).reshape((depthY, depthX))
+
+            # Генерируем облако точек
+            points_3d, _ = self.generate_point_cloud(depth_img,
+                                                     np.zeros_like(depth_img),  # Без порога огня
+                                                     self.fx, self.fy, self.cx, self.cy)
+            obstacle_detected = False
+            left_points = 0
+            right_points = 0
+
+            # Проверяем препятствия в зоне 0.1..0.5м, |x|<0.7
+            for x, y, z in points_3d:
+                if 0.1 < z < 0.5 and abs(x) < 0.7:
+                    obstacle_detected = True
+                    if x < 0:
+                        left_points += 1
+                    else:
+                        right_points += 1
+
+            if obstacle_detected:
+                # Если препятствие, выбираем сторону с меньшим количеством точек
+                turn_direction = 1 if left_points > right_points else -1
+                return True, turn_direction
+            return False, 0
+        except Exception as e:
+            print("Ошибка в analyze_point_cloud_for_snake:")
+            traceback.print_exc()
+            return False, 0  # По умолчанию нет препятствия
+
+    ####################################################################
+
+    def finish_backing_up(self, turn_direction):
+        """
+        Вызывается после того, как робот 2 секунды ехал назад.
+        Далее поворачиваем влево или вправо,
+        затем возобновляем движение «змейкой».
+        """
+        try:
+            print("Отъезд назад завершён, теперь поворачиваем...")
+
+            self.move_robot(0, turn_direction * self.speed * 0.7)
+            self.obstacle_phase = 2
+
+            # Запускаем таймер «поворота» (пусть ~1.5 сек)
+            if self.turn_timer is None:
+                self.turn_timer = QTimer()
+                self.turn_timer.setSingleShot(True)
+                self.turn_timer.timeout.connect(self.finish_turning)
+            self.turn_timer.start(1500)
+        except Exception as e:
+            print("Ошибка в finish_backing_up:")
+            traceback.print_exc()
+
+    def finish_turning(self):
+        """Вызывается когда поворот окончен. Возобновляем «змейку»."""
+        try:
+            print("Поворот завершён, продолжаем движение змейкой.")
+            self.move_robot(self.speed, 0)  # Можно сразу поехать вперёд или остановиться
+
+            self.obstacle_phase = 0
+            self.resume_snake_timer()
+        except Exception as e:
+            print("Ошибка в finish_turning:")
+            traceback.print_exc()
+
+    def stop_snake_timer(self):
+        """Останавливаем таймер змейки, если активен."""
+        if self.snake_timer and self.snake_timer.isActive():
+            self.snake_timer.stop()
+            print("Таймер змейки остановлен (объезд).")
+
+    def resume_snake_timer(self):
+        """Возобновляем таймер змейки с прежней логикой."""
+        if self.snake_timer:
+            self.snake_timer.start(3000)
+            print("Таймер змейки возобновлён.")
 
     def update_camera_images(self):
         try:
@@ -316,17 +549,14 @@ class RobotController(QWidget):
             # Применение пороговой фильтрации для выделения огня
             hsv_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
 
-            # Корректные границы для красного цвета (включая нижний и верхний диапазон)
-            lower_red1 = np.array([0, 100, 100])  # Нижняя граница для первого диапазона красного
-            upper_red1 = np.array([10, 255, 255])  # Верхняя граница для первого диапазона красного
-            lower_red2 = np.array([160, 100, 100])  # Нижняя граница для второго диапазона красного
-            upper_red2 = np.array([179, 255, 255])  # Верхняя граница для второго диапазона красного
+            # Границы для красного (два диапазона)
+            lower_red1 = np.array([0, 100, 100])
+            upper_red1 = np.array([10, 255, 255])
+            lower_red2 = np.array([160, 100, 100])
+            upper_red2 = np.array([179, 255, 255])
 
-            # Маски для двух диапазонов красного
             mask1 = cv2.inRange(hsv_img, lower_red1, upper_red1)
             mask2 = cv2.inRange(hsv_img, lower_red2, upper_red2)
-
-            # Объединяем маски
             threshold_img = cv2.bitwise_or(mask1, mask2)
 
             # Оценка координат очага возгорания
@@ -338,8 +568,6 @@ class RobotController(QWidget):
 
             if contours:
                 largest_contour = max(contours, key=cv2.contourArea)
-
-                # Вычисляем моменты контура
                 M = cv2.moments(largest_contour)
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"])
@@ -348,17 +576,15 @@ class RobotController(QWidget):
                     fire_detected = True
 
                     # Рисуем центр очага на изображении
-                    cv2.circle(detection_img, fire_coordinates, 5, (0, 0, 255), -1)  # Красный круг для очага
+                    cv2.circle(detection_img, fire_coordinates, 5, (0, 0, 255), -1)
 
                     # Вычисляем расстояние до огня
                     depth = self.get_depth_at_point(fire_coordinates[0], fire_coordinates[1])
                     if depth is not None and depth > 0:
-                        fire_distance = depth * 5.0  # Масштабируем глубину
+                        fire_distance = depth * 5.0
                         print(f"fire_distance = {fire_distance} meters")
                     else:
                         print("Не удалось получить глубину в точке огня.")
-                else:
-                    fire_detected = False
 
             # Получаем изображение с глубинной камеры
             resolution = self.sim.getVisionSensorResolution(self.depth_camera_handle)
@@ -375,7 +601,7 @@ class RobotController(QWidget):
             points_3d, colors = self.generate_point_cloud(depth_img, threshold_img, self.fx, self.fy, self.cx, self.cy)
             obstacle_detected, turn_direction = self.analyze_point_cloud(points_3d)
 
-            # Автономное управление
+            # Автономное управление ОГНЕМ и ПРЕПЯТСТВИЯМИ
             if fire_detected:
                 self.aim_manipulator(fire_coordinates, depth_img, self.fx, self.fy, self.cx, self.cy)
                 self.manipulator_default_position = False
@@ -383,24 +609,21 @@ class RobotController(QWidget):
                 if self.fire_extinguishing:
                     self.move_robot(0, 0)  # Робот тушит огонь
                 elif fire_distance is not None and fire_distance < 0.5:
-                    # Начинаем тушение, если достаточно близко
                     self.fire_extinguishing = True
                     self.fire_detected_once = True
                     self.extinguishing_timer.start(30000)  # 30 секунд
                     print("Начинаем тушение огня.")
                     self.move_robot(0, 0)
                 else:
-                    # Продолжаем движение к огню
                     self.move_robot(self.speed, 0)
             else:
                 if not self.manipulator_default_position:
-                    # Возвращаем манипулятор в исходное положение
                     self.reset_manipulator()
                     self.manipulator_default_position = True
 
                 if obstacle_detected:
-                    # Избегание препятствий
-                    self.move_robot(0, turn_direction * self.speed * 0.5)  # Замедляем разворот
+                    print(f"Избегаем препятствие. Поворачиваем {'вправо' if turn_direction == 1 else 'влево'}.")
+                    self.move_robot(0, turn_direction * self.speed * 0.5)
                 else:
                     self.move_robot(self.speed, 0)
 
@@ -439,23 +662,23 @@ class RobotController(QWidget):
             self.overlay_image_item.setPixmap(QPixmap.fromImage(overlay_qimg))
 
         except Exception as e:
-            print(f"Ошибка при обновлении изображений с камер: {e}")
+            print("Ошибка при обновлении изображений с камер:")
             traceback.print_exc()
 
     def on_extinguishing_finished(self):
-        self.fire_extinguishing = False
-        self.move_robot(self.speed, 0)
-        print("Тушение огня завершено, продолжаем движение.")
+        try:
+            self.fire_extinguishing = False
+            self.move_robot(self.speed, 0)
+            print("Тушение огня завершено, продолжаем движение.")
+        except Exception as e:
+            print("Ошибка в on_extinguishing_finished:")
+            traceback.print_exc()
 
     def get_depth_at_point(self, x, y):
-        # Получаем глубину в точке (x, y)
         try:
             depth_buffer = self.sim.getVisionSensorDepth(self.depth_camera_handle)[0]
             depthX, depthY = self.sim.getVisionSensorResolution(self.depth_camera_handle)
             depth_img = np.frombuffer(depth_buffer, dtype=np.float32).reshape((depthY, depthX))
-            # Не инвертируем изображение глубины
-
-            # Проверка границ
             if 0 <= x < depthX and 0 <= y < depthY:
                 depth = depth_img[y, x]
                 return depth
@@ -463,109 +686,116 @@ class RobotController(QWidget):
                 print(f"Координаты ({x}, {y}) выходят за границы изображения глубины ({depthX}, {depthY})")
                 return None
         except Exception as e:
-            print(f"Ошибка при получении глубины в точке: {e}")
+            print("Ошибка в get_depth_at_point:")
+            traceback.print_exc()
             return None
 
     def generate_point_cloud(self, depth_img, threshold_img, fx, fy, cx, cy):
-        h, w = depth_img.shape
-        points_3d = []
-        colors = []
+        try:
+            h, w = depth_img.shape
+            points_3d = []
+            colors = []
+            for y in range(0, h, 5):
+                for x in range(0, w, 5):
+                    depth = depth_img[y, x]
+                    if depth > 0:
+                        z = depth * 5.0
+                        px = (x - cx) * z / fx
+                        py = (y - cy) * z / fy
+                        points_3d.append([px, py, z])
 
-        for y in range(0, h, 5):  # Шаг 5 пикселей для более подробного облака
-            for x in range(0, w, 5):
-                depth = depth_img[y, x]
-                if depth > 0:
-                    z = depth * 5.0  # Масштабируем глубину
-                    px = (x - cx) * z / fx
-                    py = (y - cy) * z / fy
-                    points_3d.append([px, py, z])
-
-                    # Проверяем, является ли пиксель огнём
-                    if threshold_img[y, x] != 0:
-                        color = (0, 0, 255)  # Красный
-                    else:
-                        color = (255, 0, 0)  # Синий
-                    colors.append(color)
-
-        return points_3d, colors
+                        # Проверяем, является ли пиксель огнём
+                        if threshold_img[y, x] != 0:
+                            color = (0, 0, 255)  # Красный
+                        else:
+                            color = (255, 0, 0)  # Синий
+                        colors.append(color)
+            return points_3d, colors
+        except Exception as e:
+            print("Ошибка в generate_point_cloud:")
+            traceback.print_exc()
+            return [], []
 
     def analyze_point_cloud(self, points_3d):
-        obstacle_threshold = 0.3  # Пороговое расстояние для обнаружения препятствия (30 см)
-        obstacle_detected = False
-        left_points = 0
-        right_points = 0
+        try:
+            obstacle_threshold = 0.3
+            obstacle_detected = False
+            left_points = 0
+            right_points = 0
 
-        for point in points_3d:
-            x, y, z = point
-            if 0.1 < z < obstacle_threshold and abs(x) < 0.7:
-                obstacle_detected = True
-                if x < 0:
-                    left_points += 1
+            for (x, y, z) in points_3d:
+                if 0.1 < z < obstacle_threshold and abs(x) < 0.7:
+                    obstacle_detected = True
+                    if x < 0:
+                        left_points += 1
+                    else:
+                        right_points += 1
+
+            if obstacle_detected:
+                if left_points > right_points:
+                    turn_direction = 1  # вправо
                 else:
-                    right_points += 1
+                    turn_direction = -1 # влево
+                return True, turn_direction
+            return False, 0
+        except Exception as e:
+            print("Ошибка в analyze_point_cloud:")
+            traceback.print_exc()
+            return False, 0
 
-        if obstacle_detected:
-            if left_points > right_points:
-                turn_direction = 1  # Поворачиваем вправо
-            else:
-                turn_direction = -1  # Поворачиваем влево
-            print(f"Обнаружено препятствие. Поворачиваем {'вправо' if turn_direction == 1 else 'влево'}.")
-        else:
-            turn_direction = 0  # Продолжать движение
-
-        return obstacle_detected, turn_direction
-
-    def project_to_2d(self,points_3d, fx, fy, cx, cy):
-        points_2d = []
-        for point in points_3d:
-            if len(point) == 3:  # Убедитесь, что точка имеет три координаты
-                x, y, z = point
-                if z > 0:  # Избегаем деления на ноль
-                    u = fx * x / z + cx
-                    v = fy * y / z + cy
-                    points_2d.append((u, v))
+    def project_to_2d(self, points_3d, fx, fy, cx, cy):
+        try:
+            points_2d = []
+            for point in points_3d:
+                if len(point) == 3:
+                    x, y, z = point
+                    if z > 0:
+                        u = fx * x / z + cx
+                        v = fy * y / z + cy
+                        points_2d.append((u, v))
                 else:
-                    print(f"Пропуск точки с некорректным z: {z}")
-            else:
-                print(f"Пропуск точки с неправильным форматом: {point}")
-        return points_2d
+                    print(f"Пропуск точки с неправильным форматом: {point}")
+            return points_2d
+        except Exception as e:
+            print("Ошибка в project_to_2d:")
+            traceback.print_exc()
+            return []
 
     def display_point_cloud(self, rgb_img, points_2d, colors):
-        for (u, v), color in zip(points_2d, colors):
-           overlay_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
-           h, w = overlay_img.shape[:2]
-
-           for (u, v), color in zip(points_2d, colors):
-               if 0 <= u < w and 0 <= v < h:
-                   cv2.circle(overlay_img, (int(u), int(v)), 2, color, -1)
-
-           overlay_img_rgb = cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB)
-           return overlay_img_rgb
+        try:
+            overlay_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+            h, w = overlay_img.shape[:2]
+            for (u, v), color in zip(points_2d, colors):
+                if 0 <= u < w and 0 <= v < h:
+                    cv2.circle(overlay_img, (int(u), int(v)), 2, color, -1)
+            overlay_img_rgb = cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB)
+            return overlay_img_rgb
+        except Exception as e:
+            print("Ошибка в display_point_cloud:")
+            traceback.print_exc()
+            return rgb_img
 
     def aim_manipulator(self, fire_coordinates, depth_img, fx, fy, cx, cy):
-        x_img, y_img = fire_coordinates
-        depth = depth_img[y_img, x_img]
-        if depth > 0:
-            # Инвертируем координату x для наведения манипулятора
-            x_img_inverted = depth_img.shape[1] - x_img
-
-            # Вычисляем реальные координаты
-            z = depth * 5.0  # Масштабируем глубину
-            x = (x_img_inverted - cx) * z / fx
-            y = (y_img - cy) * z / fy
-
-            # Командуем манипулятору навестись на (x, y, z)
-            self.point_manipulator_at(x, y, z)
-        else:
-            print("Не удалось получить глубину в точке наведения манипулятора.")
+        try:
+            x_img, y_img = fire_coordinates
+            depth = depth_img[y_img, x_img]
+            if depth > 0:
+                x_img_inverted = depth_img.shape[1] - x_img
+                z = depth * 5.0
+                x = (x_img_inverted - cx) * z / fx
+                y = (y_img - cy) * z / fy
+                self.point_manipulator_at(x, y, z)
+            else:
+                print("Не удалось получить глубину в точке наведения манипулятора.")
+        except Exception as e:
+            print("Ошибка в aim_manipulator:")
+            traceback.print_exc()
 
     def point_manipulator_at(self, x, y, z):
         try:
-            # Вычисляем углы для суставов манипулятора
             angle_x = float(np.arctan2(y, z))
             angle_y = float(np.arctan2(x, z))
 
-            # Ограничиваем углы в диапазоне [-pi/2, pi/2]
             max_angle = math.pi / 2
             min_angle = -math.pi / 2
             angle_x = np.clip(angle_x, min_angle, max_angle)
@@ -573,102 +803,28 @@ class RobotController(QWidget):
 
             print(f"Устанавливаемые углы манипулятора: angle_x={angle_x}, angle_y={angle_y}")
 
-            # Меняем местами управление суставами
             self.sim.setJointTargetPosition(self.manipulator_joint_x, angle_y)
             self.sim.setJointTargetPosition(self.manipulator_joint_y, angle_x)
-
         except Exception as e:
-            print(f"Ошибка при наведении манипулятора: {e}")
+            print("Ошибка в point_manipulator_at:")
             traceback.print_exc()
 
     def reset_manipulator(self):
         try:
-            # Возвращаем суставы манипулятора в изначальные положения (например, 0 радиан)
             self.sim.setJointTargetPosition(self.manipulator_joint_x, 0.0)
             self.sim.setJointTargetPosition(self.manipulator_joint_y, 0.0)
             print("Возвращаем манипулятор в исходное положение.")
         except Exception as e:
-            print(f"Ошибка при возврате манипулятора: {e}")
+            print("Ошибка в reset_manipulator:")
             traceback.print_exc()
 
-    def move_snake_pattern(self):
-        """Запускает движение робота по змейке."""
-        self.snake_step = 0  # Номер текущего шага
-        self.snake_direction = 1  # 1 - вправо, -1 - влево
-        self.obstacle_avoidance_active = False  # Флаг предотвращения столкновений
-
-        self.snake_timer = QTimer()
-        self.snake_timer.timeout.connect(self.execute_snake_step)
-        self.snake_timer.start(3000)  # Интервал смены движения (3 сек)
-
-    def execute_snake_step(self):
-        """Выполняет один шаг змейки, учитывая препятствия."""
-        obstacle_detected, turn_direction = self.analyze_environment()
-
-        if obstacle_detected:
-            # Если препятствие перед роботом, пробуем его обойти
-            if self.can_avoid_obstacle(turn_direction):
-                print(f"Обход препятствия, поворачиваем {'вправо' if turn_direction == 1 else 'влево'}")
-                self.move_robot(0, turn_direction * self.speed * 0.7)  # Поворачиваем в свободную сторону
-            else:
-                print("Препятствие не обойти – разворот на 180°")
-                self.move_robot(0, math.pi / 2)  # Разворот на 180 градусов
-                self.snake_direction *= -1  # Меняем направление змейки
-        else:
-            # Движение по змейке (если нет препятствий)
-            if self.snake_step % 2 == 0:
-                print("Робот двигается прямо")
-                self.move_robot(self.speed, 0)
-            else:
-                print(f"Робот поворачивает {'вправо' if self.snake_direction == 1 else 'влево'}")
-                self.move_robot(0, self.snake_direction * self.speed * 0.5)
-                self.snake_direction *= -1  # Меняем направление поворота
-
-        self.snake_step += 1
-
-    def can_avoid_obstacle(self, turn_direction):
-        """Проверяет, можно ли обойти препятствие в заданную сторону."""
-        points_3d, _ = self.generate_point_cloud(self.depth_img, np.zeros_like(self.depth_img), self.fx, self.fy,
-                                                 self.cx, self.cy)
-
-        clearance_zone = []
-
-        for x, y, z in points_3d:
-            if 0.1 < z < 0.5 and abs(x) < 0.7:  # Препятствия перед роботом
-                clearance_zone.append(x)
-
-        if turn_direction == 1:  # Поворот вправо
-            return all(x > 0 for x in clearance_zone)  # Проверяем, есть ли свободное место справа
-        else:  # Поворот влево
-            return all(x < 0 for x in clearance_zone)  # Проверяем, есть ли свободное место слева
-
-    def analyze_environment(self):
-        """Проверяет наличие препятствий перед роботом и определяет направление объезда."""
-        points_3d, _ = self.generate_point_cloud(self.depth_img, np.zeros_like(self.depth_img), self.fx, self.fy,
-                                                 self.cx, self.cy)
-
-        obstacle_detected = False
-        left_count = 0
-        right_count = 0
-
-        for x, y, z in points_3d:
-            if 0.1 < z < 0.5 and abs(x) < 0.7:  # Препятствие в зоне перед роботом
-                obstacle_detected = True
-                if x < 0:
-                    left_count += 1
-                else:
-                    right_count += 1
-
-        if obstacle_detected:
-            turn_direction = 1 if left_count > right_count else -1  # Выбираем сторону объезда
-            return True, turn_direction
-        return False, 0  # Препятствий нет
-
     def closeEvent(self, event):
-        event.accept()
+        try:
+            event.accept()
+        except Exception as e:
+            print("Ошибка при закрытии приложения:")
+            traceback.print_exc()
 
-import sys
-import traceback
 
 if __name__ == '__main__':
     try:
@@ -677,6 +833,7 @@ if __name__ == '__main__':
         controller.show()
         sys.exit(app.exec_())
     except Exception as e:
-        print("Программа аварийно завершилась с ошибкой:")
+        print("Необработанное исключение при запуске приложения:")
         traceback.print_exc()
-        input("Нажмите Enter, чтобы выйти.")
+        input("Нажмите Enter для выхода.")
+        sys.exit(1)
