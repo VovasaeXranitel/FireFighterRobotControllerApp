@@ -158,6 +158,10 @@ class RobotController(QWidget):
         self.setLayout(main_layout)
         self.setGeometry(100, 100, 1600, 800)
 
+        self.snakeButton = QPushButton('Двигаться по змейке', self)
+        self.snakeButton.clicked.connect(self.move_snake_pattern)
+        control_layout.addWidget(self.snakeButton)
+
     def connectToSim(self):
         try:
             self.client = RemoteAPIClient()
@@ -311,9 +315,19 @@ class RobotController(QWidget):
 
             # Применение пороговой фильтрации для выделения огня
             hsv_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
-            lower_bound = np.array([15, 100, 100])  # Нижняя граница HSV
-            upper_bound = np.array([35, 255, 255])  # Верхняя граница HSV
-            threshold_img = cv2.inRange(hsv_img, lower_bound, upper_bound)
+
+            # Корректные границы для красного цвета (включая нижний и верхний диапазон)
+            lower_red1 = np.array([0, 100, 100])  # Нижняя граница для первого диапазона красного
+            upper_red1 = np.array([10, 255, 255])  # Верхняя граница для первого диапазона красного
+            lower_red2 = np.array([160, 100, 100])  # Нижняя граница для второго диапазона красного
+            upper_red2 = np.array([179, 255, 255])  # Верхняя граница для второго диапазона красного
+
+            # Маски для двух диапазонов красного
+            mask1 = cv2.inRange(hsv_img, lower_red1, upper_red1)
+            mask2 = cv2.inRange(hsv_img, lower_red2, upper_red2)
+
+            # Объединяем маски
+            threshold_img = cv2.bitwise_or(mask1, mask2)
 
             # Оценка координат очага возгорания
             contours, _ = cv2.findContours(threshold_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -321,6 +335,7 @@ class RobotController(QWidget):
             fire_detected = False
             fire_coordinates = None
             fire_distance = None  # Расстояние до огня
+
             if contours:
                 largest_contour = max(contours, key=cv2.contourArea)
 
@@ -333,7 +348,7 @@ class RobotController(QWidget):
                     fire_detected = True
 
                     # Рисуем центр очага на изображении
-                    cv2.circle(detection_img, fire_coordinates, 5, (0, 0, 255), -1)
+                    cv2.circle(detection_img, fire_coordinates, 5, (0, 0, 255), -1)  # Красный круг для очага
 
                     # Вычисляем расстояние до огня
                     depth = self.get_depth_at_point(fire_coordinates[0], fire_coordinates[1])
@@ -576,11 +591,92 @@ class RobotController(QWidget):
             print(f"Ошибка при возврате манипулятора: {e}")
             traceback.print_exc()
 
+    def move_snake_pattern(self):
+        """Запускает движение робота по змейке."""
+        self.snake_step = 0  # Номер текущего шага
+        self.snake_direction = 1  # 1 - вправо, -1 - влево
+        self.obstacle_avoidance_active = False  # Флаг предотвращения столкновений
+
+        self.snake_timer = QTimer()
+        self.snake_timer.timeout.connect(self.execute_snake_step)
+        self.snake_timer.start(3000)  # Интервал смены движения (3 сек)
+
+    def execute_snake_step(self):
+        """Выполняет один шаг змейки, учитывая препятствия."""
+        obstacle_detected, turn_direction = self.analyze_environment()
+
+        if obstacle_detected:
+            # Если препятствие перед роботом, пробуем его обойти
+            if self.can_avoid_obstacle(turn_direction):
+                print(f"Обход препятствия, поворачиваем {'вправо' if turn_direction == 1 else 'влево'}")
+                self.move_robot(0, turn_direction * self.speed * 0.7)  # Поворачиваем в свободную сторону
+            else:
+                print("Препятствие не обойти – разворот на 180°")
+                self.move_robot(0, math.pi / 2)  # Разворот на 180 градусов
+                self.snake_direction *= -1  # Меняем направление змейки
+        else:
+            # Движение по змейке (если нет препятствий)
+            if self.snake_step % 2 == 0:
+                print("Робот двигается прямо")
+                self.move_robot(self.speed, 0)
+            else:
+                print(f"Робот поворачивает {'вправо' if self.snake_direction == 1 else 'влево'}")
+                self.move_robot(0, self.snake_direction * self.speed * 0.5)
+                self.snake_direction *= -1  # Меняем направление поворота
+
+        self.snake_step += 1
+
+    def can_avoid_obstacle(self, turn_direction):
+        """Проверяет, можно ли обойти препятствие в заданную сторону."""
+        points_3d, _ = self.generate_point_cloud(self.depth_img, np.zeros_like(self.depth_img), self.fx, self.fy,
+                                                 self.cx, self.cy)
+
+        clearance_zone = []
+
+        for x, y, z in points_3d:
+            if 0.1 < z < 0.5 and abs(x) < 0.7:  # Препятствия перед роботом
+                clearance_zone.append(x)
+
+        if turn_direction == 1:  # Поворот вправо
+            return all(x > 0 for x in clearance_zone)  # Проверяем, есть ли свободное место справа
+        else:  # Поворот влево
+            return all(x < 0 for x in clearance_zone)  # Проверяем, есть ли свободное место слева
+
+    def analyze_environment(self):
+        """Проверяет наличие препятствий перед роботом и определяет направление объезда."""
+        points_3d, _ = self.generate_point_cloud(self.depth_img, np.zeros_like(self.depth_img), self.fx, self.fy,
+                                                 self.cx, self.cy)
+
+        obstacle_detected = False
+        left_count = 0
+        right_count = 0
+
+        for x, y, z in points_3d:
+            if 0.1 < z < 0.5 and abs(x) < 0.7:  # Препятствие в зоне перед роботом
+                obstacle_detected = True
+                if x < 0:
+                    left_count += 1
+                else:
+                    right_count += 1
+
+        if obstacle_detected:
+            turn_direction = 1 if left_count > right_count else -1  # Выбираем сторону объезда
+            return True, turn_direction
+        return False, 0  # Препятствий нет
+
     def closeEvent(self, event):
         event.accept()
 
+import sys
+import traceback
+
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    controller = RobotController()
-    controller.show()
-    sys.exit(app.exec_())
+    try:
+        app = QApplication(sys.argv)
+        controller = RobotController()
+        controller.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        print("Программа аварийно завершилась с ошибкой:")
+        traceback.print_exc()
+        input("Нажмите Enter, чтобы выйти.")
