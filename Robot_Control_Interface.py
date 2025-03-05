@@ -3,9 +3,6 @@ import math
 import numpy as np
 import cv2
 import traceback
-import random
-import time
-
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QGraphicsView,
@@ -16,17 +13,20 @@ from PyQt5.QtGui import QImage, QPixmap
 from zmqRemoteApi import RemoteAPIClient
 
 
-###########################################################
+################################################################
 # Глобальный перехватчик необработанных исключений
-###########################################################
+################################################################
 def my_excepthook(exctype, value, tb):
     print("Необработанное исключение!")
     traceback.print_exception(exctype, value, tb)
     input("Нажмите Enter, чтобы выйти.")
     sys.exit(1)
 
+
 sys.excepthook = my_excepthook
-###########################################################
+
+
+################################################################
 
 
 class RobotController(QWidget):
@@ -59,6 +59,11 @@ class RobotController(QWidget):
             self.prev_gray_frame = None
             self.p0 = None
 
+            # Храним «хорошие» точки оптического потока, чтобы analyze_environment
+            # мог объединять облако точек и оптический поток
+            self.flow_good_old = None
+            self.flow_good_new = None
+
             # Таймеры
             self.timer = QTimer()
             self.timer.timeout.connect(self.update_camera_images)
@@ -72,11 +77,6 @@ class RobotController(QWidget):
             self.snake_step = 0
             self.snake_direction = 1
             self.snake_timer = None
-
-            self.obstacle_phase = 0  # Для отслеживания этапов при объезде
-            self.back_timer = None  # Таймер для отъезда назад
-            self.turn_timer = None  # Таймер для поворота
-
 
         except Exception as e:
             print("Ошибка в __init__:")
@@ -239,33 +239,36 @@ class RobotController(QWidget):
             print("Ошибка подключения к CoppeliaSim:")
             traceback.print_exc()
 
+    #################################################################
+    #   ОБНОВЛЁННЫЙ UPDATE_OPTICAL_FLOW: Храним good_old, good_new
+    #################################################################
     def update_optical_flow(self):
         try:
-            # Получаем изображение с камеры
             rgb_img_data, resX, resY = self.sim.getVisionSensorCharImage(self.rgb_camera_handle)
             frame = np.frombuffer(rgb_img_data, dtype=np.uint8).reshape(resY, resX, 3)
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
 
             if self.prev_gray_frame is None:
-                # Инициализируем точки при первом вызове
                 self.prev_gray_frame = gray_frame
                 self.p0 = cv2.goodFeaturesToTrack(self.prev_gray_frame, mask=None, **self.feature_params)
                 return
 
             if self.p0 is None or len(self.p0) == 0:
-                # Если точки отсутствуют, переинициализируем их
                 self.p0 = cv2.goodFeaturesToTrack(gray_frame, mask=None, **self.feature_params)
                 self.prev_gray_frame = gray_frame
                 return
 
-            # Вычисляем оптический поток
             p1, st, err = cv2.calcOpticalFlowPyrLK(self.prev_gray_frame, gray_frame, self.p0, None, **self.lk_params)
 
             if p1 is not None:
                 good_new = p1[st == 1]
                 good_old = self.p0[st == 1]
 
-                # Рисуем векторы оптического потока
+                # Сохраняем для объединённого анализа
+                self.flow_good_old = good_old
+                self.flow_good_new = good_new
+
+                # Визуализация оптического потока
                 flow_frame = frame.copy()
                 for new, old in zip(good_new, good_old):
                     x_new, y_new = new.ravel()
@@ -273,17 +276,14 @@ class RobotController(QWidget):
                     cv2.arrowedLine(flow_frame, (int(x_old), int(y_old)), (int(x_new), int(y_new)),
                                     (0, 255, 0), 2, tipLength=0.5)
 
-                # Обновляем виджет отображения
-                flow_frame_flipped = cv2.flip(flow_frame, 0)  # Переворачиваем изображение по вертикали
+                flow_frame_flipped = cv2.flip(flow_frame, 0)
                 qimg = QImage(flow_frame_flipped.data, flow_frame_flipped.shape[1], flow_frame_flipped.shape[0],
                               flow_frame_flipped.strides[0], QImage.Format_RGB888)
                 self.optical_flow_image_item.setPixmap(QPixmap.fromImage(qimg))
 
-                # Обновляем предыдущий кадр и точки
                 self.prev_gray_frame = gray_frame.copy()
                 self.p0 = good_new.reshape(-1, 1, 2)
             else:
-                # Если поток не вычислен, реинициализируем точки
                 self.p0 = cv2.goodFeaturesToTrack(gray_frame, mask=None, **self.feature_params)
                 self.prev_gray_frame = gray_frame
 
@@ -293,7 +293,6 @@ class RobotController(QWidget):
 
     def move_robot(self, linear_velocity, angular_velocity):
         try:
-            # Ограничиваем скорость
             max_speed = 5.0
             linear_velocity = np.clip(linear_velocity, -max_speed, max_speed)
             angular_velocity = np.clip(angular_velocity, -max_speed, max_speed)
@@ -349,193 +348,186 @@ class RobotController(QWidget):
             traceback.print_exc()
 
     ####################################################################
-    #                        Автономное движение
+    # ЛОГИКА ДВИЖЕНИЯ ЗМЕЙКОЙ (с учётом препятствий, обнаруженных
+    # как по облаку точек, так и по оптическому потоку)
     ####################################################################
     def move_snake_pattern(self):
         """
-        Запускает движение «змейкой» в автономном режиме.
+        Запускает движение робота по «змейке».
         """
         try:
-            # Инициализируем шаги, направление
             self.snake_step = 0
             self.snake_direction = 1
-
             if self.snake_timer is None:
                 self.snake_timer = QTimer()
                 self.snake_timer.timeout.connect(self.execute_snake_step)
 
-            self.snake_timer.start(3000)  # Каждые 3 секунды меняем движение
+            self.snake_timer.start(3000)
             print("Движение по змейке запущено.")
         except Exception as e:
             print("Ошибка при запуске движения змейкой:")
-            traceback.print_exc()
-
-    def execute_snake_step(self):
-        """
-        Выполняет один шаг в траектории «змейки».
-        Если обнаружено препятствие, останавливаем «змейку»
-        и переходим в режим постоянного объезда,
-        пока препятствие не исчезнет.
-        """
-        try:
-            obstacle_detected, turn_direction = self.analyze_point_cloud_for_snake()
-
-            if obstacle_detected:
-                print("Обнаружено препятствие. Переходим в режим объезда.")
-                self.stop_snake_timer()  # Останавливаем обычное движение змейкой
-                # Запускаем «цикл объезда»
-                self.handle_obstacle(turn_direction)
-            else:
-                # Обычная логика змейки
-                if self.snake_step % 2 == 0:
-                    print("Робот двигается прямо (шаг змейки).")
-                    self.move_robot(self.speed, 0)
-                else:
-                    dir_text = 'вправо' if self.snake_direction == 1 else 'влево'
-                    print(f"Робот поворачивает {dir_text} (шаг змейки).")
-                    self.move_robot(0, self.snake_direction * self.speed * 0.5)
-                    self.snake_direction *= -1  # Меняем направление
-
-                self.snake_step += 1
-        except Exception as e:
-            print("Ошибка при выполнении шага змейки:")
-            traceback.print_exc()
-
-    def handle_obstacle(self, desired_direction):
-        """
-        'Цикл объезда': пока робот видит препятствие,
-        он продолжает выполнять манёвры объезда (например, отъезжает назад, поворачивает).
-        После каждого шага снова проверяем, осталось ли препятствие.
-
-        desired_direction — направление (1: вправо, -1: влево),
-        в которое робот будет стараться уводить нос, чтобы обойти препятствие.
-        """
-        try:
-            obstacle_detected, turn_dir = self.analyze_point_cloud_for_snake()
-
-            if obstacle_detected:
-                print("Робот всё ещё видит препятствие, продолжаем объезжать...")
-                # Например, сдаём чуть назад и поворачиваем
-                # 1) Назад (либо сразу поворот, на ваш выбор)
-                self.move_robot(-self.speed, 0)
-
-                # Через секунду делаем поворот
-                QTimer.singleShot(1000, lambda: self._turn_and_check(desired_direction))
-            else:
-                print("Препятствие исчезло, возвращаемся к змейке.")
-                self.resume_snake_timer()  # Возобновляем движение змейкой
-        except Exception as e:
-            print("Ошибка в handle_obstacle:")
-            traceback.print_exc()
-
-    def _turn_and_check(self, desired_direction):
-        """
-        Вызывается после того, как робот чуть отъехал назад.
-        Теперь делаем поворот, затем снова проверяем препятствие.
-        """
-        try:
-            # Поворот (усиленный)
-            self.move_robot(0, desired_direction * self.speed * 0.7)
-
-            # Ещё через секунду снова проверяем, осталось ли препятствие
-            QTimer.singleShot(1000, lambda: self.handle_obstacle(desired_direction))
-        except Exception as e:
-            print("Ошибка в _turn_and_check:")
-            traceback.print_exc()
-
-    def analyze_point_cloud_for_snake(self):
-        """
-        Упрощённая проверка препятствий перед роботом
-        (можно переиспользовать analyze_point_cloud, если удобно).
-        Возвращает (obstacle_detected, turn_direction).
-        """
-        try:
-            # Получаем текущее глубинное изображение
-            depth_buffer = self.sim.getVisionSensorDepth(self.depth_camera_handle)[0]
-            depthX, depthY = self.sim.getVisionSensorResolution(self.depth_camera_handle)
-            depth_img = np.frombuffer(depth_buffer, dtype=np.float32).reshape((depthY, depthX))
-
-            # Генерируем облако точек
-            points_3d, _ = self.generate_point_cloud(depth_img,
-                                                     np.zeros_like(depth_img),  # Без порога огня
-                                                     self.fx, self.fy, self.cx, self.cy)
-            obstacle_detected = False
-            left_points = 0
-            right_points = 0
-
-            # Проверяем препятствия в зоне 0.1..0.5м, |x|<0.7
-            for x, y, z in points_3d:
-                if 0.1 < z < 0.5 and abs(x) < 0.7:
-                    obstacle_detected = True
-                    if x < 0:
-                        left_points += 1
-                    else:
-                        right_points += 1
-
-            if obstacle_detected:
-                # Если препятствие, выбираем сторону с меньшим количеством точек
-                turn_direction = 1 if left_points > right_points else -1
-                return True, turn_direction
-            return False, 0
-        except Exception as e:
-            print("Ошибка в analyze_point_cloud_for_snake:")
-            traceback.print_exc()
-            return False, 0  # По умолчанию нет препятствия
-
-    ####################################################################
-
-    def finish_backing_up(self, turn_direction):
-        """
-        Вызывается после того, как робот 2 секунды ехал назад.
-        Далее поворачиваем влево или вправо,
-        затем возобновляем движение «змейкой».
-        """
-        try:
-            print("Отъезд назад завершён, теперь поворачиваем...")
-
-            self.move_robot(0, turn_direction * self.speed * 0.7)
-            self.obstacle_phase = 2
-
-            # Запускаем таймер «поворота» (пусть ~1.5 сек)
-            if self.turn_timer is None:
-                self.turn_timer = QTimer()
-                self.turn_timer.setSingleShot(True)
-                self.turn_timer.timeout.connect(self.finish_turning)
-            self.turn_timer.start(1500)
-        except Exception as e:
-            print("Ошибка в finish_backing_up:")
-            traceback.print_exc()
-
-    def finish_turning(self):
-        """Вызывается когда поворот окончен. Возобновляем «змейку»."""
-        try:
-            print("Поворот завершён, продолжаем движение змейкой.")
-            self.move_robot(self.speed, 0)  # Можно сразу поехать вперёд или остановиться
-
-            self.obstacle_phase = 0
-            self.resume_snake_timer()
-        except Exception as e:
-            print("Ошибка в finish_turning:")
             traceback.print_exc()
 
     def stop_snake_timer(self):
         """Останавливаем таймер змейки, если активен."""
         if self.snake_timer and self.snake_timer.isActive():
             self.snake_timer.stop()
-            print("Таймер змейки остановлен (объезд).")
+            print("Таймер змейки остановлен (из-за препятствия).")
 
     def resume_snake_timer(self):
-        """Возобновляем таймер змейки с прежней логикой."""
+        """Возобновляем таймер змейки."""
         if self.snake_timer:
             self.snake_timer.start(3000)
             print("Таймер змейки возобновлён.")
 
+    def execute_snake_step(self):
+        """
+        Выполняет один шаг змейки:
+         - Проверяет, есть ли препятствие (analyze_environment)
+         - Если есть, объезжает
+         - Если нет, двигается по схеме (прямо -> поворот -> прямо -> ...)
+        """
+        try:
+            obstacle_detected, turn_direction = self.analyze_environment()
+
+            if obstacle_detected:
+                print("Обнаружено препятствие по объединённым данным. Выполняем объезд.")
+                # Останавливаем змейку
+                self.stop_snake_timer()
+                # Пример «откатиться назад, затем повернуть»
+                self.move_robot(-self.speed, 0)
+                QTimer.singleShot(1500, lambda: self.finish_backing_up(turn_direction))
+            else:
+                # Стандартная «змейка»
+                if self.snake_step % 2 == 0:
+                    print("Робот двигается прямо (змейка).")
+                    self.move_robot(self.speed, 0)
+                else:
+                    dir_text = 'вправо' if self.snake_direction == 1 else 'влево'
+                    print(f"Робот поворачивает {dir_text} (змейка).")
+                    self.move_robot(0, self.snake_direction * self.speed * 0.5)
+                    self.snake_direction *= -1
+
+                self.snake_step += 1
+        except Exception as e:
+            print("Ошибка при выполнении шага змейки:")
+            traceback.print_exc()
+
+    def finish_backing_up(self, turn_direction):
+        """Вызывается после того, как робот 1.5 сек сдавал назад."""
+        try:
+            print("Откат завершён, поворачиваем для объезда...")
+            self.move_robot(0, turn_direction * self.speed * 0.7)
+            QTimer.singleShot(1500, self.finish_turning)
+        except Exception as e:
+            print("Ошибка в finish_backing_up:")
+            traceback.print_exc()
+
+    def finish_turning(self):
+        """Заканчиваем поворот, возобновляем змейку."""
+        try:
+            print("Поворот завершён, продолжаем движение змейкой.")
+            self.move_robot(self.speed, 0)
+            self.resume_snake_timer()
+        except Exception as e:
+            print("Ошибка в finish_turning:")
+            traceback.print_exc()
+
+    ####################################################################
+    # ОБЪЕДИНЁННЫЙ АНАЛИЗ: облако точек + оптический поток
+    ####################################################################
+    def analyze_environment(self):
+        """
+        Слияние облака точек (depth) и оптического потока (flow)
+        для решения об объезде препятствия.
+        Возвращает: (obstacle_detected, turn_direction).
+        """
+
+        try:
+            # 1) Проверяем облако точек
+            depth_buffer = self.sim.getVisionSensorDepth(self.depth_camera_handle)[0]
+            depthX, depthY = self.sim.getVisionSensorResolution(self.depth_camera_handle)
+            depth_img = np.frombuffer(depth_buffer, dtype=np.float32).reshape((depthY, depthX))
+
+            points_3d, _ = self.generate_point_cloud(
+                depth_img,
+                np.zeros_like(depth_img),  # неиспользуем threshold для огня
+                self.fx, self.fy, self.cx, self.cy
+            )
+
+            # analyze_point_cloud => (bool_obstacle, direction)
+            cloud_obstacle, cloud_dir = self.analyze_point_cloud(points_3d)
+
+            # 2) Проверяем оптический поток
+            flow_obstacle = False
+            if (self.flow_good_old is not None) and (self.flow_good_new is not None):
+                flow_obstacle = self.detect_obstacle_by_flow(
+                    self.flow_good_old, self.flow_good_new, depthX, depthY
+                )
+
+            # 3) Сливаем
+            # Логика: если хотя бы один говорит «объект», считаем, что препятствие
+            obstacle_detected = cloud_obstacle or flow_obstacle
+
+            if obstacle_detected:
+                if cloud_obstacle:
+                    turn_direction = cloud_dir
+                else:
+                    # Если «только поток» видит препятствие, поворачиваем вправо (или влево)
+                    turn_direction = 1
+                return True, turn_direction
+
+            return False, 0
+
+        except Exception as e:
+            print("Ошибка в analyze_environment:")
+            traceback.print_exc()
+            return False, 0
+
+    def detect_obstacle_by_flow(self, old_pts, new_pts, width, height):
+        """
+        Пример упрощённой детекции препятствия по оптическому потоку:
+        - Смотрим центральную область кадра
+        - Считаем среднюю длину векторов
+        - Если > 2.0 пикселей/кадр, считаем, что есть препятствие
+        """
+        try:
+            roi_left = width * 1 / 3
+            roi_right = width * 2 / 3
+            roi_top = height * 1 / 3
+            roi_bottom = height * 2 / 3
+
+            vectors_in_roi = []
+            for (ox, oy), (nx, ny) in zip(old_pts, new_pts):
+                if roi_left < ox < roi_right and roi_top < oy < roi_bottom:
+                    dx = nx - ox
+                    dy = ny - oy
+                    vectors_in_roi.append((dx, dy))
+
+            if len(vectors_in_roi) == 0:
+                return False
+
+            magnitudes = [math.hypot(dx, dy) for (dx, dy) in vectors_in_roi]
+            avg_mag = np.mean(magnitudes)
+
+            # Порог, подбирайте под свою сцену:
+            if avg_mag > 2.0:
+                return True
+            return False
+        except Exception as e:
+            print("Ошибка в detect_obstacle_by_flow:")
+            traceback.print_exc()
+            return False
+
+    ####################################################################
+    # ЛОГИКА РАБОТЫ С КАМЕРОЙ, ОГНЁМ, ГЛУБИНОЙ
+    ####################################################################
     def update_camera_images(self):
         try:
             # Проверяем, запущена ли симуляция
             sim_state = self.sim.getSimulationState()
             if sim_state != self.sim.simulation_advancing_running:
-                return  # Если симуляция не запущена, выходим из метода
+                return
 
             if not hasattr(self, 'rgb_camera_handle') or not hasattr(self, 'depth_camera_handle'):
                 print("Ошибка: Дескрипторы камер не установлены.")
@@ -546,10 +538,10 @@ class RobotController(QWidget):
             rgb_img = np.frombuffer(rgb_img_data, dtype=np.uint8).reshape(resY, resX, 3)
             bgr_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
 
-            # Применение пороговой фильтрации для выделения огня
+            # Пороговая фильтрация для выделения огня
             hsv_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
 
-            # Границы для красного (два диапазона)
+            # Границы для красного
             lower_red1 = np.array([0, 100, 100])
             upper_red1 = np.array([10, 255, 255])
             lower_red2 = np.array([160, 100, 100])
@@ -564,7 +556,7 @@ class RobotController(QWidget):
             detection_img = bgr_img.copy()
             fire_detected = False
             fire_coordinates = None
-            fire_distance = None  # Расстояние до огня
+            fire_distance = None
 
             if contours:
                 largest_contour = max(contours, key=cv2.contourArea)
@@ -575,13 +567,11 @@ class RobotController(QWidget):
                     fire_coordinates = (cx, cy)
                     fire_detected = True
 
-                    # Рисуем центр очага на изображении
                     cv2.circle(detection_img, fire_coordinates, 5, (0, 0, 255), -1)
 
-                    # Вычисляем расстояние до огня
-                    depth = self.get_depth_at_point(fire_coordinates[0], fire_coordinates[1])
-                    if depth is not None and depth > 0:
-                        fire_distance = depth * 5.0
+                    depth_val = self.get_depth_at_point(cx, cy)
+                    if depth_val is not None and depth_val > 0:
+                        fire_distance = depth_val * 5.0
                         print(f"fire_distance = {fire_distance} meters")
                     else:
                         print("Не удалось получить глубину в точке огня.")
@@ -592,26 +582,29 @@ class RobotController(QWidget):
             depth_buffer = self.sim.getVisionSensorDepth(self.depth_camera_handle)[0]
             depth_img = np.frombuffer(depth_buffer, dtype=np.float32).reshape((depthY, depthX))
 
-            # Нормализация глубинного изображения для отображения
+            # Нормализация глубинного изображения
             depth_display_img = cv2.normalize(depth_img, None, 0, 255, cv2.NORM_MINMAX)
             depth_display_img = depth_display_img.astype(np.uint8)
             depth_display_img = cv2.applyColorMap(depth_display_img, cv2.COLORMAP_JET)
 
-            # Генерация облака точек и анализ препятствий
-            points_3d, colors = self.generate_point_cloud(depth_img, threshold_img, self.fx, self.fy, self.cx, self.cy)
-            obstacle_detected, turn_direction = self.analyze_point_cloud(points_3d)
+            # Генерация облака точек (для отображения)
+            points_3d, colors = self.generate_point_cloud(
+                depth_img, threshold_img,
+                self.fx, self.fy, self.cx, self.cy
+            )
+            # analyze_point_cloud + detect_obstacle_by_flow => объединены в analyze_environment
 
-            # Автономное управление ОГНЕМ и ПРЕПЯТСТВИЯМИ
+            # Логика «огонь» + «препятствие»
             if fire_detected:
                 self.aim_manipulator(fire_coordinates, depth_img, self.fx, self.fy, self.cx, self.cy)
                 self.manipulator_default_position = False
 
                 if self.fire_extinguishing:
-                    self.move_robot(0, 0)  # Робот тушит огонь
+                    self.move_robot(0, 0)  # тушим
                 elif fire_distance is not None and fire_distance < 0.5:
                     self.fire_extinguishing = True
                     self.fire_detected_once = True
-                    self.extinguishing_timer.start(30000)  # 30 секунд
+                    self.extinguishing_timer.start(30000)
                     print("Начинаем тушение огня.")
                     self.move_robot(0, 0)
                 else:
@@ -620,20 +613,17 @@ class RobotController(QWidget):
                 if not self.manipulator_default_position:
                     self.reset_manipulator()
                     self.manipulator_default_position = True
+                # Ниже — код обычного движения, но у нас уже есть логика змейки,
+                # поэтому можно оставить move_robot(...) = self.speed, 0
+                # или ничего не делать (змейка сама рулит)
+                # self.move_robot(self.speed, 0)
 
-                if obstacle_detected:
-                    print(f"Избегаем препятствие. Поворачиваем {'вправо' if turn_direction == 1 else 'влево'}.")
-                    self.move_robot(0, turn_direction * self.speed * 0.5)
-                else:
-                    self.move_robot(self.speed, 0)
-
-            # Конвертируем изображения обратно в RGB для отображения
+            # Отображение (перевороты)
             rgb_display_img = cv2.flip(rgb_img, 0)
             threshold_display_img = cv2.flip(threshold_img, 0)
             detection_display_img = cv2.flip(detection_img, 0)
             depth_display_img_flipped = cv2.flip(depth_display_img, 0)
 
-            # Отображение этапов обработки
             rgb_qimg = QImage(rgb_display_img.data, rgb_display_img.shape[1], rgb_display_img.shape[0],
                               rgb_display_img.strides[0], QImage.Format_RGB888)
             self.rgb_image_item.setPixmap(QPixmap.fromImage(rgb_qimg))
@@ -653,7 +643,7 @@ class RobotController(QWidget):
                                 QImage.Format_RGB888)
             self.depth_image_item.setPixmap(QPixmap.fromImage(depth_qimg))
 
-            # Обновление изображения облака точек
+            # Отображение облака точек
             points_2d = self.project_to_2d(points_3d, self.fx, self.fy, self.cx, self.cy)
             overlay_img = self.display_point_cloud(rgb_img, points_2d, colors)
             overlay_display_img = cv2.flip(overlay_img, 0)
@@ -680,10 +670,9 @@ class RobotController(QWidget):
             depthX, depthY = self.sim.getVisionSensorResolution(self.depth_camera_handle)
             depth_img = np.frombuffer(depth_buffer, dtype=np.float32).reshape((depthY, depthX))
             if 0 <= x < depthX and 0 <= y < depthY:
-                depth = depth_img[y, x]
-                return depth
+                return depth_img[y, x]
             else:
-                print(f"Координаты ({x}, {y}) выходят за границы изображения глубины ({depthX}, {depthY})")
+                print(f"Координаты ({x}, {y}) выходят за границы ({depthX}, {depthY})")
                 return None
         except Exception as e:
             print("Ошибка в get_depth_at_point:")
@@ -704,11 +693,11 @@ class RobotController(QWidget):
                         py = (y - cy) * z / fy
                         points_3d.append([px, py, z])
 
-                        # Проверяем, является ли пиксель огнём
+                        # цвет - красный если threshold_img[y,x]!=0, иначе синий
                         if threshold_img[y, x] != 0:
-                            color = (0, 0, 255)  # Красный
+                            color = (0, 0, 255)
                         else:
-                            color = (255, 0, 0)  # Синий
+                            color = (255, 0, 0)
                         colors.append(color)
             return points_3d, colors
         except Exception as e:
@@ -733,15 +722,39 @@ class RobotController(QWidget):
 
             if obstacle_detected:
                 if left_points > right_points:
-                    turn_direction = 1  # вправо
+                    return True, 1  # вправо
                 else:
-                    turn_direction = -1 # влево
-                return True, turn_direction
+                    return True, -1  # влево
             return False, 0
         except Exception as e:
             print("Ошибка в analyze_point_cloud:")
             traceback.print_exc()
             return False, 0
+
+    def detect_obstacle_by_flow(self, old_pts, new_pts, width, height):
+        try:
+            roi_left = width * 1 / 3
+            roi_right = width * 2 / 3
+            roi_top = height * 1 / 3
+            roi_bottom = height * 2 / 3
+
+            vectors_in_roi = []
+            for (ox, oy), (nx, ny) in zip(old_pts, new_pts):
+                if roi_left < ox < roi_right and roi_top < oy < roi_bottom:
+                    dx = nx - ox
+                    dy = ny - oy
+                    vectors_in_roi.append((dx, dy))
+
+            if len(vectors_in_roi) == 0:
+                return False
+
+            magnitudes = [math.hypot(dx, dy) for (dx, dy) in vectors_in_roi]
+            avg_mag = np.mean(magnitudes)
+            return (avg_mag > 2.0)
+        except Exception as e:
+            print("Ошибка в detect_obstacle_by_flow:")
+            traceback.print_exc()
+            return False
 
     def project_to_2d(self, points_3d, fx, fy, cx, cy):
         try:
@@ -753,8 +766,6 @@ class RobotController(QWidget):
                         u = fx * x / z + cx
                         v = fy * y / z + cy
                         points_2d.append((u, v))
-                else:
-                    print(f"Пропуск точки с неправильным форматом: {point}")
             return points_2d
         except Exception as e:
             print("Ошибка в project_to_2d:")
@@ -801,7 +812,7 @@ class RobotController(QWidget):
             angle_x = np.clip(angle_x, min_angle, max_angle)
             angle_y = np.clip(angle_y, min_angle, max_angle)
 
-            print(f"Устанавливаемые углы манипулятора: angle_x={angle_x}, angle_y={angle_y}")
+            print(f"Углы манипулятора: angle_x={angle_x:.2f}, angle_y={angle_y:.2f}")
 
             self.sim.setJointTargetPosition(self.manipulator_joint_x, angle_y)
             self.sim.setJointTargetPosition(self.manipulator_joint_y, angle_x)
